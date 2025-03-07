@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Real-time GPS Tracking</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+</head>
+<body>
+    <div id="map" style="width: 100%; height: 600px;"></div>
+    <script>
+        var map = L.map('map').setView([37.7749, -122.4194], 15);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 25
+        }).addTo(map);
+
+        var marker = L.marker([37.7749, -122.4194]).addTo(map);
+
+        function updateMap() {
+            $.getJSON('/latest-coordinates', function(data) {
+                var lat = data[0];
+                var lon = data[1];
+                marker.setLatLng([lat, lon]);
+                map.setView([lat, lon], 19);
+            });
+        }
+
+        setInterval(updateMap, 5000);  // Update every 5 seconds
+    </script>
+</body>
+</html>
