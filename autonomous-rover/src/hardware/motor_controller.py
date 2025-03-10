@@ -75,36 +75,53 @@ class MotorController:
     
     def set_steering(self, direction_degrees):
         """
-        Set the steering direction in degrees.
-        Negative = LEFT turn, Positive = RIGHT turn, 0 = straight
+        Set steering with smooth proportional differential response
         """
-        # Store current steering angle
+        # Store current steering
         self.current_steering = direction_degrees
         
-        # Get current base speed
+        # IMPROVED: Use a smooth, truly proportional response curve
+        # Convert degrees to a normalized differential factor
+        # This gives a nice sigmoidal response curve that's gentle for small angles
+        # but appropriately strong for larger angles
+        
+        # Parameters for response curve
+        max_differential = 0.90   # Maximum differential at extreme angles
+        sensitivity = 0.05        # Higher = more sensitive to small angles
+        
+        # Calculate normalized differential factor using sigmoid-like function
+        # This creates a smooth S-curve response from 0 to max_differential
+        normalized_angle = abs(direction_degrees) / 45.0  # Normalize to [0,1] range at 45 degrees
+        differential_factor = max_differential * (normalized_angle / (sensitivity + normalized_angle))
+        
+        # Calculate motor speeds with true proportional response
         base_speed = self.max_speed
         
-        # SIMPLIFIED APPROACH: Use direct logic with clear comments
-        if direction_degrees < 0:  # NEGATIVE = LEFT TURN
-            # For LEFT turn: LEFT motor slower, RIGHT motor faster
-            left_speed = max(0, base_speed * 0.1)  # Very slow left motor
-            right_speed = base_speed  # Full speed right motor
-            logger.info(f"LEFT TURN: {direction_degrees:.1f}°")
-        elif direction_degrees > 0:  # POSITIVE = RIGHT TURN
-            # For RIGHT turn: RIGHT motor slower, LEFT motor faster
-            left_speed = base_speed  # Full speed left motor
-            right_speed = max(0, base_speed * 0.1)  # Very slow right motor
-            logger.info(f"RIGHT TURN: {direction_degrees:.1f}°")
-        else:  # Go straight
-            left_speed = base_speed
-            right_speed = base_speed
-            logger.info("STRAIGHT")
+        if direction_degrees < 0:  # LEFT TURN
+            # Left turn: reduce left motor proportionally
+            left_factor = 1.0 - differential_factor
+            right_factor = 1.0
+            logger.info(f"LEFT TURN: {direction_degrees:.1f}° (differential: {differential_factor:.3f})")
+        elif direction_degrees > 0:  # RIGHT TURN
+            # Right turn: reduce right motor proportionally
+            left_factor = 1.0
+            right_factor = 1.0 - differential_factor
+            logger.info(f"RIGHT TURN: {direction_degrees:.1f}° (differential: {differential_factor:.3f})")
+        else:  # STRAIGHT
+            # Perfectly straight
+            left_factor = 1.0
+            right_factor = 1.0
         
-        # Store the calculated speeds
+        # Calculate final motor speeds
+        left_speed = base_speed * left_factor
+        right_speed = base_speed * right_factor
+        
+        # Add diagnostic output to understand response curve
+        logger.info(f"Motor speeds: L={left_speed:.3f}, R={right_speed:.3f}, Ratio: {left_speed/right_speed if right_speed > 0 else 'inf':.3f}")
+        
+        # Store and apply motor speeds
         self.left_speed = left_speed
         self.right_speed = right_speed
-        
-        # Apply the speeds to motors
         self._apply_motor_speeds()
         
         return True

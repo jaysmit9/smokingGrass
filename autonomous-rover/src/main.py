@@ -1,15 +1,23 @@
-import argparse
-import numpy as np
-import json
-import time
 import sys
 import os
-from datetime import datetime
-import logging
-from geopy.distance import geodesic  # Add this import for geodesic calculations
+from datetime import datetime  # Add this if it's missing
 
-# Import Stanley controller components
-from controllers.stanley_controller import StanleyController
+from geopy.distance import geodesic  # Add this import for the GPS test function
+
+# Add the project root to Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# Use absolute imports
+import numpy as np
+import time
+import json
+import logging
+import argparse
+import traceback
+from src.hardware.gps_monitor import GPSMonitor
+from src.hardware.motor_controller import MotorController
+from src.controllers.stanley_controller import StanleyController
+from geopy.distance import geodesic  # Add this import for the GPS test function
 
 # Conditionally import visualization modules for simulation mode
 try:
@@ -57,79 +65,92 @@ def load_waypoints(waypoints_file):
         logger.error(f"Failed to load waypoints: {e}")
         sys.exit(1)
 
-def run_simulation(waypoints_file, config=None):
-    """Run the rover in simulation mode"""
-    if not MATPLOTLIB_AVAILABLE:
-        logger.error("Matplotlib is required for simulation mode")
-        return
+def run_simulation(waypoints_file, config=None, k=None, k_e=None):
+    """Run a simulation with the Stanley controller"""
     
-    # Default configuration
-    if config is None:
+    # Set up default config if none provided
+    if not config:
         config = {
-            'k': 15.8,                      # Stanley gain for heading error
-            'k_e': 13.0,                   # Stanley gain for cross-track error
-            'dt': 0.1,                     # Time step (seconds)
-            'L': 1.0,                      # Wheelbase (meters)
-            'max_steer': np.radians(90),   # Maximum steering angle
-            'target_speed': 1.0,           # Target speed (m/s)
-            'extension_distance': 1.0,     # Extension distance beyond final waypoint
-            'waypoint_reach_threshold': 1.0  # Distance threshold to consider waypoint reached
+            'k': 0.2 if k is None else k,               # Heading error gain
+            'k_e': 0.1 if k_e is None else k_e,            # CRITICAL: Reduce Cross-track error gain from 1.0 to 0.2
+            'dt': 0.1,              # Update rate
+            'L': 1.0,               # Wheelbase
+            'max_steer': np.radians(50),  # Maximum steering angle
+            'target_speed': 0.5,    # Target speed (m/s)
+            'extension_distance': 1.0,  # Extension distance
+            'waypoint_reach_threshold': 1.0,  # Increased to 3m
+            'update_rate': 10.0     # Hz
         }
     
     # Load waypoints
     waypoints = load_waypoints(waypoints_file)
     
-    # Add extension waypoint
-    controller = StanleyController(
-        waypoints, 
-        k=config['k'], 
-        k_e=config['k_e'], 
-        L=config['L'], 
-        max_steer=config['max_steer'],
-        waypoint_reach_threshold=config['waypoint_reach_threshold']
-    )
-    waypoints = controller.add_extension_waypoint(config['extension_distance'])
+    # Create controller (PURE ALGORITHM - NO HARDWARE)
+    controller = StanleyController(waypoints, 
+                                  k=config['k'], 
+                                  k_e=config['k_e'],
+                                  L=config['L'],
+                                  max_steer=config['max_steer'],
+                                  waypoint_reach_threshold=config['waypoint_reach_threshold'])
     
-    # Initial state setup
-    x = waypoints[0, 0]  # Initial latitude
-    y = waypoints[0, 1]  # Initial longitude
-    v = 0.0              # Initial velocity
+    # Create hardware interfaces SEPARATELY
+    gps = GPSMonitor(simulation_mode=True)
+    motors = MotorController()
     
-    # Set initial yaw to face the first waypoint
-    dx = waypoints[1, 0] - x
-    dy = waypoints[1, 1] - y
-    yaw = np.arctan2(dy, dx)
-    
-    # Constants for geographic coordinate conversion
-    METERS_PER_LAT_DEGREE = 111000
-    
-    # Run simulation
-    logger.info("Starting simulation...")
-    
-    # Import simulation specific functions
-    from simulation.simulator import simulate, plot_results, create_animation
-    
-    results = simulate(
-        waypoints, x, y, yaw, v, 
-        target_idx=1,  # Start with second waypoint as target
-        k=config['k'], 
-        k_e=config['k_e'],
-        target_speed=config['target_speed'],
-        dt=config['dt'],
-        L=config['L'],
-        max_steer=config['max_steer'],
-        waypoint_reach_threshold=config['waypoint_reach_threshold'],
-        METERS_PER_LAT_DEGREE=METERS_PER_LAT_DEGREE
-    )
-    
-    # Plot results
-    plot_results(results, waypoints)
-    
-    # Create animation if requested
-    if '--animate' in sys.argv:
-        create_animation(results, waypoints)
-    
-    logger.info("Simulation completed")
+    # Main simulation loop
+    try:
+        update_interval = 1.0 / config['update_rate']
+        last_update_time = time.time()
+        simulation_complete = False
+        
+        while not simulation_complete:
+            current_time = time.time()
+            
+            # Check if it's time for an update
+            if current_time - last_update_time >= update_interval:
+                last_update_time = current_time
+                
+                # Get current position - FROM GPS, NOT CONTROLLER
+                x, y, yaw, v = gps.get_position_and_heading()
+                
+                # Add this diagnostic logging
+                heading_deg = np.degrees(yaw) % 360
+                logger.info(f"Current heading: {heading_deg:.1f}° (raw: {np.degrees(yaw):.1f}°)")
+
+                # For simulation, use fixed speed 
+                v = config['target_speed']
+                
+                # Call pure controller with current position
+                delta, target_idx, distance, cte, yaw_error = controller.stanley_control(x, y, yaw, v)
+                
+                # Apply to hardware/simulation
+                motors.set_steering(np.degrees(delta))
+                motors.set_speed(v)
+                
+                # Update simulation
+                gps.update_simulation(delta, v)
+                
+                # CRITICAL ADDITION: Check if we've reached the final waypoint
+                if target_idx == len(waypoints) - 1 and distance < config['waypoint_reach_threshold']:
+                    logger.info("*** ALL WAYPOINTS REACHED! SIMULATION COMPLETE ***")
+                    simulation_complete = True
+                    break
+            
+            # Small delay to prevent CPU hogging
+            time.sleep(0.01)
+        
+        # Simulation completed successfully
+        print("\n=============================================")
+        print("🏁 SIMULATION SUCCESSFULLY COMPLETED! 🏁")
+        print("All waypoints reached.")
+        print("=============================================\n")
+        
+    except KeyboardInterrupt:
+        print("\nSimulation stopped by user")
+        
+    finally:
+        motors.stop()
+        print("Simulation ended.")
 
 def run_hardware(waypoints_file, config=None):
     """Run the rover with real hardware"""
@@ -165,8 +186,8 @@ def run_hardware(waypoints_file, config=None):
     
     # Import hardware interfaces
     try:
-        from hardware.gps_monitor import GPSMonitor
-        from hardware.motor_controller import MotorController
+        from src.hardware.gps_monitor import GPSMonitor
+        from src.hardware.motor_controller import MotorController
     except ImportError as e:
         logger.error(f"Failed to import hardware modules: {e}")
         logger.error("Make sure the hardware modules are in the Python path")
@@ -225,8 +246,6 @@ def run_hardware(waypoints_file, config=None):
         # (after creating motors but before the control loop starts)
         # This will help us see where set_speed is being called
 
-        import traceback
-
         # Monkey patch the set_speed method to add more detailed logging
         original_set_speed = motors.set_speed
 
@@ -265,19 +284,16 @@ def run_hardware(waypoints_file, config=None):
                     # Limit steering angle
                     delta = np.clip(delta, -config['max_steer'], config['max_steer'])
                     
-                    # Adjust speed based on steering angle (just calculate it, don't apply yet)
+                    # Adjust speed based on steering angle
                     current_target_speed = config['target_speed']
                     if abs(delta) > np.radians(30):
                         current_target_speed *= 0.5  # Slow down for sharp turns
                     elif abs(delta) > np.radians(15):
                         current_target_speed *= 0.7  # Moderate speed for moderate turns
 
-                    # Convert steering angle to degrees for the motor controller
-                    steering_degrees = np.degrees(delta)
-
-                    # Apply steering ONCE (and only once)
-                    motors.set_steering(steering_degrees)
-                    motors.set_heading_error(np.degrees(yaw_error))  # Store heading error for logging
+                    # Apply steering and speed
+                    motors.set_steering(np.degrees(delta))
+                    motors.set_speed(current_target_speed)
                     
                     # Get motor status for logging
                     motor_status = motors.get_status()
@@ -355,11 +371,11 @@ def run_gps_test(waypoints_file, config=None):
     # Initialize hardware but don't activate motors
     try:
         # Get GPS
-        from hardware.gps_monitor import GPSMonitor
+        from src.hardware.gps_monitor import GPSMonitor
         gps = GPSMonitor(simulation_mode='--sim' in sys.argv)
         
         # Initialize motors but don't use them
-        from hardware.motor_controller import MotorController
+        from src.hardware.motor_controller import MotorController
         motors = MotorController()
         motors.set_speed(0)  # Ensure motors are stopped
         

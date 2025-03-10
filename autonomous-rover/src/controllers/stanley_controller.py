@@ -1,20 +1,25 @@
 import numpy as np
-import json
+import math
 from geopy.distance import geodesic
-from hardware.gps_monitor import GPSMonitor
-from hardware.motor_controller import MotorController
+import json  # For main function
 
 class StanleyController:
-    def __init__(self, waypoints, k=4.8, k_e=10.0, L=1.0, max_steer=np.radians(50), waypoint_reach_threshold=1.0):
+    def __init__(self, waypoints, k=6.0, k_e=0.2, L=1.0, max_steer=0.8726645886, waypoint_reach_threshold=3.0):
+        # Initialize controller parameters
         self.waypoints = waypoints
-        self.k = k
-        self.k_e = k_e
+        self.k = k           # Heading gain (keep as is)
+        self.k_e = k_e       # DRASTICALLY REDUCE CTE GAIN from 1.0 to 0.2
         self.L = L
         self.max_steer = max_steer
-        self.waypoint_reach_threshold = waypoint_reach_threshold  # Add this line
-        self.target_idx = 1  # Initial target waypoint index
-        self.gps_monitor = GPSMonitor()
-        self.motor_controller = MotorController()
+        self.waypoint_reach_threshold = waypoint_reach_threshold
+        self.target_idx = 1
+        self.prev_delta = 0.0
+        
+        # Debug info
+        print(f"Stanley controller initialized with {len(waypoints)} waypoints")
+        print(f"Waypoint reach threshold: {waypoint_reach_threshold} meters")
+        print(f"Targeting initial waypoint {self.target_idx}")
+        print(f"Controller gains: k={k} (heading), k_e={k_e} (CTE)")
 
     def add_extension_waypoint(self, extension_distance=1.0):
         if len(self.waypoints) < 2:
@@ -51,44 +56,58 @@ class StanleyController:
         return extended_waypoints
 
     def haversine_distance(self, coord1, coord2):
-        return geodesic(coord1, coord2).meters
-
-    def control_loop(self):
-        while True:
-            current_position = self.gps_monitor.get_position()
-            x, y, yaw, v = current_position
-            
-            delta, self.target_idx, distance, cte, yaw_error = self.stanley_control(x, y, yaw, v)
-            self.motor_controller.set_speed(v)
-            self.motor_controller.set_steering(delta)
+        """Calculate the great circle distance between two points in meters"""
+        lat1, lon1 = coord1
+        lat2, lon2 = coord2
+        return geodesic((lat1, lon1), (lat2, lon2)).meters
 
     def stanley_control(self, x, y, yaw, v):
-        """Stanley controller with proper CTE calculation and direction fixes"""
-        # Find nearest waypoint (keeping your existing code)
+        """Stanley controller with adaptive gains"""
+        # Normalize yaw and convert to degrees (keep existing code)
+        yaw = yaw % (2 * np.pi)
+        current_heading_deg = np.degrees(yaw) % 360
+        
+        # Print position (keep existing code)
+        print(f"\nCurrent position: ({x:.6f}, {y:.6f}), heading: {np.degrees(yaw):.1f}°, speed: {v:.1f}m/s")
+        
+        # Find target waypoint (keep existing code)
+        old_target = self.target_idx
         self.target_idx = self._find_target_waypoint(x, y, self.target_idx)
         
+        # Log waypoint changes (keep existing code)
+        if old_target != self.target_idx:
+            print(f"TARGET CHANGED from {old_target} to {self.target_idx}")
+            # Print all waypoints
+        
+        # Get waypoints and calculate distance (keep existing code)
         current_point = self.waypoints[self.target_idx]
-        # Get current and next waypoints
-       
-        # Get previous waypoint (for CTE calculation)
         prev_idx = max(0, self.target_idx - 1)
         prev_point = self.waypoints[prev_idx]
         
-        # Calculate distance to target waypoint
+        # CRITICAL DEBUG: Print target waypoint and current position
+        print(f"Target waypoint: {current_point[0]:.7f}, {current_point[1]:.7f}")
+        print(f"Current position: {x:.7f}, {y:.7f}")
+        
         distance = self.haversine_distance((x, y), current_point)
         
-        # CALCULATE CROSS-TRACK ERROR (CTE)
-        # ... (keeping your existing code for CTE calculation)    # CALCULATE CROSS-TRACK ERROR (CTE)
+        # CRITICAL DEBUG: Print calculated distance
+        print(f"Calculated distance: {distance:.2f} meters")
+        
+        # Calculate CTE (keep existing code)
+        # ===== CALCULATE CTE (MISSING CODE) =====
         # 1. Calculate path segment vector (from prev to current waypoint)
         path_vector = [current_point[0] - prev_point[0], current_point[1] - prev_point[1]]
         
         # 2. Calculate vector from prev point to current position
         pos_vector = [x - prev_point[0], y - prev_point[1]]
         
-        # 3. Calculate path length
+        # 3. Calculate path length - this was missing!
         path_length = np.sqrt(path_vector[0]**2 + path_vector[1]**2)
         
-        # 4. Calculate projection of position onto path and CTE
+        # 4. Calculate projection of position onto path - this was missing!
+        projection = 0  # Default value
+        cte = 0  # Default value
+        
         if path_length > 0:
             # Normalize path vector
             path_unit = [path_vector[0]/path_length, path_vector[1]/path_length]
@@ -112,60 +131,47 @@ class StanleyController:
         else:
             # If path is a point, CTE is just distance to the point
             cte = self.haversine_distance((x, y), prev_point)
+            projection = 0
+        # =================================================
         
-        # Get current heading in degrees (0-360)
-        current_heading_deg = np.degrees(yaw) % 360
-        
-        # Calculate bearing to target waypoint
+        # Get bearing to target and calculate heading error (keep existing code)
         bearing_deg = self._calculate_bearing(x, y, current_point[0], current_point[1])
-        
-        # Calculate heading error (how much we need to turn)
-        # Normalize to -180 to 180 range
         heading_error_deg = bearing_deg - current_heading_deg
         while heading_error_deg > 180:
             heading_error_deg -= 360
         while heading_error_deg < -180:
             heading_error_deg += 360
-        
-        # Convert heading error to radians
         heading_error = np.radians(heading_error_deg)
         
-        # FIX 1: For large heading errors (>45°), prioritize heading correction
-        if abs(heading_error_deg) > 45:
-            # For large errors, use mostly heading error, reduce CTE influence
-            heading_term = heading_error
-            
-            # Cross-track error term with reduced gain for large heading errors
-            v_safe = max(v, 0.1)
-            cte_term = np.arctan2(self.k_e * 0.1 * cte, v_safe)  # Reduce CTE influence
-            
-            # Apply controller gain to heading term
-            heading_term = self.k * heading_term
-            
-            # Combine terms, with heading term dominating
-            delta = heading_term + cte_term
-            
-            # FIX 2: Ensure delta has same sign as heading error for large errors
-            if abs(heading_error) > np.radians(60) and (heading_error * delta < 0):
-                # If delta and heading error have opposite signs for large errors,
-                # force delta to match heading error's sign
-                delta = abs(delta) * (1 if heading_error > 0 else -1)
-        else:
-            # Normal Stanley control for small errors
-            heading_term = heading_error
-            
-            # Cross-track error term
-            v_safe = max(v, 0.1)
-            cte_term = np.arctan2(self.k_e * cte, v_safe)
-            
-            # Apply gains separately
-            heading_term = self.k * heading_term
-            
-            # Combine terms
-            delta = heading_term + cte_term
+        # Calculate distance to target waypoint
+        distance = self.haversine_distance((x, y), self.waypoints[self.target_idx])
         
-        # Limit steering angle
+        # Adaptive gains based on distance
+        k_scale = min(1.0, distance / 10.0)  # Scale from 0-1 up to 10m
+        k_e_scale = min(1.0, distance / 5.0)  # Scale from 0-1 up to 5m
+        
+        adaptive_k = self.k * k_scale
+        adaptive_k_e = self.k_e * k_e_scale
+        
+        # Calculate heading term
+        heading_term = adaptive_k * heading_error
+        
+        # Calculate CTE term
+        cte = self._calculate_cross_track_error(x, y, yaw)
+        cte_term = np.arctan2(adaptive_k_e * cte, v)
+        
+        # Combine terms
+        delta = heading_term + cte_term
+        
+        # Apply steering limits
         delta = np.clip(delta, -self.max_steer, self.max_steer)
+        
+        # Apply smoothing filter
+        if hasattr(self, 'prev_delta'):
+            delta = 0.7 * delta + 0.3 * self.prev_delta
+        
+        # Store for next iteration
+        self.prev_delta = delta
         
         return delta, self.target_idx, distance, cte, heading_error
 
@@ -195,24 +201,68 @@ class StanleyController:
         return (math.degrees(bearing) + 360) % 360
 
     def _find_target_waypoint(self, x, y, current_idx):
-        """Find the next waypoint to target"""
-        # Ensure current_idx is valid
-        if current_idx >= len(self.waypoints):
-            return len(self.waypoints) - 1
+        """Find the target waypoint to follow"""
+        # If we're at the start, find the closest waypoint
+        if current_idx == 0:
+            min_distance = float('inf')
+            closest_idx = -1
+            
+            for i in range(len(self.waypoints)):
+                waypoint = self.waypoints[i]
+                distance = self.haversine_distance((x, y), waypoint)
+                
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_idx = i
+            
+            return closest_idx
         
-        # Get current target waypoint
-        current_point = self.waypoints[current_idx]
+        # Otherwise, continue to the next waypoint
+        else:
+            # Get the coordinates of the current waypoint
+            current_waypoint = self.waypoints[current_idx]
+            
+            # Calculate the distance to the current waypoint
+            distance = self.haversine_distance((x, y), current_waypoint)
+            
+            # If we've reached the current target within threshold
+            if distance < self.waypoint_reach_threshold:
+                # Move to next waypoint if we have more
+                if current_idx < len(self.waypoints) - 1:
+                    next_idx = current_idx + 1
+                    return next_idx
+                else:
+                    return current_idx
+            
+            return current_idx
+
+    def _calculate_cross_track_error(self, x, y, yaw):
+        """Calculate cross track error"""
+        # Find the nearest point on the path
+        closest_point, target_idx, distance = self._find_closest_waypoint(x, y)
         
-        # Calculate distance to current target
-        distance = self.haversine_distance((x, y), current_point)
+        # Calculate the angle between the robot and the path
+        angle = np.arctan2(y - closest_point[1], x - closest_point[0])
         
-        # If we've reached the current target within threshold
-        if distance < self.waypoint_reach_threshold:
-            # Move to next waypoint if we have more
-            if current_idx < len(self.waypoints) - 1:
-                return current_idx + 1
+        # Calculate the cross track error
+        cross_track_error = distance * np.sin(angle - yaw)
         
-        return current_idx
+        return cross_track_error
+
+    def _find_closest_waypoint(self, x, y):
+        """Find the closest waypoint to the current position"""
+        min_distance = float('inf')
+        closest_idx = -1
+        
+        for i in range(len(self.waypoints)):
+            waypoint = self.waypoints[i]
+            distance = self.haversine_distance((x, y), waypoint)
+            
+            if distance < min_distance:
+                min_distance = distance
+                closest_idx = i
+        
+        return self.waypoints[closest_idx], closest_idx, min_distance
 
 def main():
     with open('data/polygon_data.json') as f:

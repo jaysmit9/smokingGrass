@@ -6,57 +6,107 @@ import random
 import os
 import numpy as np
 from geopy.distance import geodesic
+import json
 
 logger = logging.getLogger("rover.hardware.gps")
 
 class GPSMonitor:
     def __init__(self, main_port='/dev/ttyACM0', secondary_port='/dev/ttyACM1', 
-                 baud_rate=115200, timeout=0.1, use_dual_gps=True, simulation_mode=True):
-        """
-        Initialize GPS monitor with simulation capabilities
-        """
-        # For debugging purposes, print object ID to identify different instances
-        logger.info(f"Creating GPSMonitor instance {id(self)} with simulation_mode={simulation_mode}")
-        
+                 baud_rate=115200, timeout=0.1, use_dual_gps=True, simulation_mode=False):
+        """Initialize GPS monitor"""
         self.simulation_mode = simulation_mode
         self.use_dual_gps = use_dual_gps
         self.timeout = timeout
+        self.L = 1.0  # Wheelbase length in meters
         
-        # GPS data storage (matching serial_gps_monitor.py structure)
-        self.gps_data = {
-            "front": {
-                "lat": None, "lon": None, "heading": None, 
-                "speed": None, "fix_quality": 0, "last_update": 0,
-                "messages_per_sec": 0, "message_count": 0, "last_message_time": time.time()
-            },
-            "rear": {
-                "lat": None, "lon": None, "heading": None, 
-                "speed": None, "fix_quality": 0, "last_update": 0,
-                "messages_per_sec": 0, "message_count": 0, "last_message_time": time.time()
+        # For simulation calculations
+        self.lat_scale = 1.0 / 111000  # Approximate conversion (meters to degrees)
+        self.lon_scale = 1.0 / 111000  # Will be refined based on latitude
+        
+        # Initialize simulation variables
+        if simulation_mode:
+            self._init_simulation()
+        else:
+            # Your existing hardware initialization code
+            # For debugging purposes, print object ID to identify different instances
+            logger.info(f"Creating GPSMonitor instance {id(self)} with simulation_mode={simulation_mode}")
+            
+            # GPS data storage (matching serial_gps_monitor.py structure)
+            self.gps_data = {
+                "front": {
+                    "lat": None, "lon": None, "heading": None, 
+                    "speed": None, "fix_quality": 0, "last_update": 0,
+                    "messages_per_sec": 0, "message_count": 0, "last_message_time": time.time()
+                },
+                "rear": {
+                    "lat": None, "lon": None, "heading": None, 
+                    "speed": None, "fix_quality": 0, "last_update": 0,
+                    "messages_per_sec": 0, "message_count": 0, "last_message_time": time.time()
+                }
             }
-        }
+            
+            logger.info(f"Initializing GPS Monitor in {'SIMULATION' if simulation_mode else 'HARDWARE'} mode")
+            
+            if not self.simulation_mode:
+                try:
+                    import serial
+                    self.main_serial = serial.Serial(main_port, baud_rate, timeout=timeout)
+                    logger.info(f"Connected to main GPS on {main_port}")
+                    
+                    if use_dual_gps:
+                        self.secondary_serial = serial.Serial(secondary_port, baud_rate, timeout=timeout)
+                        logger.info(f"Connected to secondary GPS on {secondary_port}")
+                    
+                    # Start reader threads
+                    self._start_hardware_readers()
+                except Exception as e:
+                    logger.error(f"Failed to initialize hardware GPS: {e}")
+                    logger.info("Falling back to simulation mode")
+                    self.simulation_mode = True
+            
+            if self.simulation_mode:
+                self._start_simulation()
+    
+    def _init_simulation(self):
+        """Initialize simulation parameters"""
+        logger.info("Initializing GPS simulation")
         
-        logger.info(f"Initializing GPS Monitor in {'SIMULATION' if simulation_mode else 'HARDWARE'} mode")
+        # Load default waypoints for simulation
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        waypoints_file = os.path.join(project_root, "data", "polygon_data.json")
         
-        if not self.simulation_mode:
-            try:
-                import serial
-                self.main_serial = serial.Serial(main_port, baud_rate, timeout=timeout)
-                logger.info(f"Connected to main GPS on {main_port}")
-                
-                if use_dual_gps:
-                    self.secondary_serial = serial.Serial(secondary_port, baud_rate, timeout=timeout)
-                    logger.info(f"Connected to secondary GPS on {secondary_port}")
-                
-                # Start reader threads
-                self._start_hardware_readers()
-            except Exception as e:
-                logger.error(f"Failed to initialize hardware GPS: {e}")
-                logger.info("Falling back to simulation mode")
-                self.simulation_mode = True
-        
-        if self.simulation_mode:
-            self._start_simulation()
+        try:
+            with open(waypoints_file) as f:
+                data = json.load(f)
+            
+            # Extract waypoints
+            self.sim_waypoints = np.array([(point['lat'], point['lon']) for point in data])
+            logger.info(f"Loaded {len(self.sim_waypoints)} waypoints for GPS simulation")
+            
+            # Fix: Use actual GPS coordinates for initial position
+            self.sim_x = float(self.sim_waypoints[0][0])  # Cast to float to ensure numeric type
+            self.sim_y = float(self.sim_waypoints[0][1])
+            logger.info(f"Initial position set to: ({self.sim_x:.6f}, {self.sim_y:.6f})")
+            
+            self.sim_yaw = 0.0  # Initial heading (North)
+            self.sim_speed = 0.0  # Initial speed
+            
+            # Correct scaling factors - these are crucial for position updates
+            self.lat_scale = 1.0 / 111000  # Approx meters per degree latitude
+            self.lon_scale = 1.0 / (111000 * np.cos(np.radians(self.sim_x)))  # Adjust for latitude
+            
+        except Exception as e:
+            logger.error(f"Failed to load simulation waypoints: {e}", exc_info=True)
+            # Use actual GPS coordinates for default values
+            self.sim_waypoints = np.array([[34.151977, -77.866983], [34.152077, -77.866783]])
+            self.sim_x = 34.151977
+            self.sim_y = -77.866983
+            logger.info(f"Using default position: ({self.sim_x}, {self.sim_y})")
+            self.sim_yaw = 0.0
+            self.sim_speed = 0.0
+            self.lat_scale = 1.0 / 111000
+            self.lon_scale = 1.0 / (111000 * np.cos(np.radians(self.sim_x)))
     
     def _start_hardware_readers(self):
         """Start threads to read from real GPS hardware"""
@@ -388,28 +438,43 @@ class GPSMonitor:
         return (math.degrees(bearing) + 360) % 360
     
     def get_position_and_heading(self):
-        """
-        Get current position, heading and speed from the dual-GPS setup
-        """
-        # Use front GPS data for positioning
-        lat = self.gps_data["front"]["lat"]
-        lon = self.gps_data["front"]["lon"]
-        
-        # Calculate heading from rear to front GPS positions
-        if (self.gps_data["front"]["lat"] is not None and 
-            self.gps_data["rear"]["lat"] is not None):
-            heading = self._calculate_bearing(
-                self.gps_data["rear"]["lat"], self.gps_data["rear"]["lon"],
-                self.gps_data["front"]["lat"], self.gps_data["front"]["lon"]
-            )
+        """Get current position and heading (lat, lon, heading_deg, speed)"""
+        if self.simulation_mode:
+            # In simulation mode, just return simulation state
+            heading_deg = np.degrees(self.sim_yaw) % 360
+            return self.sim_x, self.sim_y, heading_deg, self.sim_speed
         else:
-            # Fall back to GPS-reported heading
-            heading = self.gps_data["front"]["heading"]
-        
-        # Use speed from front GPS
-        speed = self.gps_data["front"]["speed"]
-        
-        return lat, lon, heading, speed
+            # Use front GPS data for position
+            lat = self.gps_data["front"]["lat"]
+            lon = self.gps_data["front"]["lon"]
+            
+            # DIRECT IMPLEMENTATION: Always calculate heading from dual GPS if possible
+            heading_deg = None  # Default to None
+            
+            # First attempt: Calculate from dual GPS positions (most accurate)
+            if self.use_dual_gps and "rear" in self.gps_data:
+                rear_lat = self.gps_data["rear"]["lat"]
+                rear_lon = self.gps_data["rear"]["lon"]
+                
+                if (lat is not None and lon is not None and 
+                    rear_lat is not None and rear_lon is not None):
+                    # Calculate bearing from REAR to FRONT (vehicle heading)
+                    heading_deg = self._calculate_bearing(rear_lat, rear_lon, lat, lon)
+                    logger.debug(f"Dual GPS heading calculation: {heading_deg:.1f}°")
+            
+            # Second attempt: Use GPS-provided heading if dual calculation failed
+            if heading_deg is None:
+                heading_deg = self.gps_data["front"]["heading"]
+                if heading_deg is not None:
+                    logger.debug(f"Using direct GPS heading: {heading_deg:.1f}°")
+                else:
+                    heading_deg = 0.0
+                    logger.warning("No heading data available, using 0.0°")
+            
+            # Get speed in m/s
+            speed = self.gps_data["front"]["speed"] or 0.0
+            
+            return lat, lon, heading_deg, speed
     
     def stop(self):
         """Stop GPS monitoring"""
@@ -418,6 +483,68 @@ class GPSMonitor:
                 self.main_serial.close()
             if hasattr(self, 'secondary_serial') and self.use_dual_gps:
                 self.secondary_serial.close()
+    
+    def update_simulation(self, steering_angle, speed, dt=0.1):
+        """Update simulated position based on steering and speed"""
+        # Verify current position is valid
+        if abs(self.sim_x) < 0.1 or abs(self.sim_y) < 0.1:
+            logger.error(f"Invalid position detected: ({self.sim_x}, {self.sim_y})")
+            # Reset to first waypoint if available
+            if hasattr(self, 'sim_waypoints') and len(self.sim_waypoints) > 0:
+                self.sim_x = self.sim_waypoints[0][0]
+                self.sim_y = self.sim_waypoints[0][1]
+                logger.info(f"Reset position to: ({self.sim_x}, {self.sim_y})")
+        
+        # Log before state
+        logger.debug(f"Before: pos=({self.sim_x:.6f}, {self.sim_y:.6f}), "
+                  f"yaw={np.degrees(self.sim_yaw):.1f}°, steering={np.degrees(steering_angle):.1f}°")
+        
+        # Update heading
+        self.sim_yaw += speed / self.L * np.tan(steering_angle) * dt
+        self.sim_yaw = self.sim_yaw % (2 * np.pi)  # Normalize
+        
+        # Calculate position changes in degrees
+        dx = speed * np.cos(self.sim_yaw) * dt * self.lat_scale
+        dy = speed * np.sin(self.sim_yaw) * dt * self.lon_scale
+        
+        # Update position
+        self.sim_x += dx
+        self.sim_y += dy
+        
+        # Log after state
+        logger.debug(f"After: pos=({self.sim_x:.6f}, {self.sim_y:.6f}), dx={dx:.8f}, dy={dy:.8f}")
+        
+        # Update speed
+        self.sim_speed = speed
+
+    
+def run_gps_test(waypoints_file, config=None):
+    # ... existing code ...
+    
+    while True:
+        # ... existing code ...
+        
+        # Get GPS data
+        lat, lon, heading_rad, speed = gps.get_position_and_heading()
+        
+        # CRITICAL FIX: Convert heading from radians back to degrees
+        heading_deg = np.degrees(heading_rad) % 360
+        
+        # Print GPS information
+        logger.info(f"\n===== GPS DIAGNOSTICS =====")
+        logger.info(f"Position: {lat:.8f}, {lon:.8f}")
+        logger.info(f"GPS Heading: {heading_deg:.1f}° | Speed: {speed:.2f} m/s")
+
+def run_hardware(waypoints_file, config=None):
+    # ... existing code ...
+    
+    # Create GPS monitor  
+    gps = GPSMonitor(simulation_mode=False, use_dual_gps=True)
+    
+    # Apply the heading fix to ensure consistency
+
+    
+    # ... rest of the function ...
 
 # For testing
 if __name__ == "__main__":
@@ -428,8 +555,26 @@ if __name__ == "__main__":
     try:
         print("Simulating GPS movement. Press Ctrl+C to stop.")
         while True:
-            lat, lon, heading, speed = gps.get_position_and_heading()
-            print(f"Position: {lat:.7f}, {lon:.7f} | Heading: {heading:.1f}° | Speed: {speed:.1f} m/s")
+            lat, lon, heading_rad, speed = gps.get_position_and_heading()
+            
+            # CRITICAL FIX: Convert heading from radians to degrees
+            heading_deg = np.degrees(heading_rad) % 360
+            
+            print(f"Position: {lat:.7f}, {lon:.7f} | Heading: {heading_deg:.1f}° | Speed: {speed:.1f} m/s")
+            
+            # Debug: Show raw values to confirm
+            print(f"DEBUG - Raw heading in radians: {heading_rad:.4f}, converted to deg: {heading_deg:.1f}°")
+            
+            # If using dual GPS, show values for verification
+            if not gps.simulation_mode and gps.use_dual_gps:
+                front_lat = gps.gps_data["front"]["lat"]
+                front_lon = gps.gps_data["front"]["lon"]
+                rear_lat = gps.gps_data["rear"]["lat"]
+                rear_lon = gps.gps_data["rear"]["lon"]
+                if all(p is not None for p in [front_lat, front_lon, rear_lat, rear_lon]):
+                    direct_heading = gps._calculate_bearing(rear_lat, rear_lon, front_lat, front_lon)
+                    print(f"DEBUG - DIRECT: Rear to Front heading: {direct_heading:.1f}°")
+            
             time.sleep(1)
     except KeyboardInterrupt:
         print("Stopping GPS simulation")
