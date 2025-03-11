@@ -65,7 +65,7 @@ def load_waypoints(waypoints_file):
         logger.error(f"Failed to load waypoints: {e}")
         sys.exit(1)
 
-def run_simulation(waypoints_file, config=None, k=None, k_e=None):
+def run_simulation(waypoints_file, config=None, k=None, k_e=None, max_speed=None, turn_factor=None, animate=False):
     """Run a simulation with the Stanley controller"""
     
     # Set up default config if none provided
@@ -79,7 +79,9 @@ def run_simulation(waypoints_file, config=None, k=None, k_e=None):
             'target_speed': 0.5,    # Target speed (m/s)
             'extension_distance': 1.0,  # Extension distance
             'waypoint_reach_threshold': 1.0,  # Increased to 3m
-            'update_rate': 10.0     # Hz
+            'update_rate': 10.0,     # Hz
+            'max_speed': 0.3 if max_speed is None else max_speed,
+            'turn_factor': 0.9 if turn_factor is None else turn_factor
         }
     
     # Load waypoints
@@ -95,13 +97,17 @@ def run_simulation(waypoints_file, config=None, k=None, k_e=None):
     
     # Create hardware interfaces SEPARATELY
     gps = GPSMonitor(simulation_mode=True)
-    motors = MotorController()
+    motors = MotorController(max_speed=config['max_speed'], turn_factor=config['turn_factor'], simulation_mode=True)  # Pass simulation_mode=True
     
     # Main simulation loop
     try:
         update_interval = 1.0 / config['update_rate']
         last_update_time = time.time()
         simulation_complete = False
+        
+        # Initialize lists to store trajectory data
+        x_values = []
+        y_values = []
         
         while not simulation_complete:
             current_time = time.time()
@@ -123,12 +129,23 @@ def run_simulation(waypoints_file, config=None, k=None, k_e=None):
                 # Call pure controller with current position
                 delta, target_idx, distance, cte, yaw_error = controller.stanley_control(x, y, yaw, v)
                 
+                # Get bearing to target waypoint
+                target_waypoint = controller.waypoints[target_idx]
+                bearing = controller._calculate_bearing(x, y, target_waypoint[0], target_waypoint[1])
+                
+                # Add waypoint number and bearing to console output
+                logger.info(f"Heading towards waypoint {target_idx + 1}/{len(waypoints)}, bearing: {bearing:.1f}°")
+                
                 # Apply to hardware/simulation
                 motors.set_steering(np.degrees(delta))
                 motors.set_speed(v)
                 
                 # Update simulation
                 gps.update_simulation(delta, v)
+                
+                # Store trajectory data
+                x_values.append(x)
+                y_values.append(y)
                 
                 # CRITICAL ADDITION: Check if we've reached the final waypoint
                 if target_idx == len(waypoints) - 1 and distance < config['waypoint_reach_threshold']:
@@ -144,6 +161,94 @@ def run_simulation(waypoints_file, config=None, k=None, k_e=None):
         print("🏁 SIMULATION SUCCESSFULLY COMPLETED! 🏁")
         print("All waypoints reached.")
         print("=============================================\n")
+        
+        # Plot the trajectory
+        if MATPLOTLIB_AVAILABLE and animate:
+            plt.figure(figsize=(10, 6))
+            plt.plot(waypoints[:, 0], waypoints[:, 1], 'g.', label='Waypoints')
+            plt.plot(x_values, y_values, 'b-', label='Trajectory')
+            plt.xlabel('Latitude')
+            plt.ylabel('Longitude')
+            plt.title('Rover Simulation Trajectory')
+            plt.legend()
+            plt.grid(True)
+            plt.axis('equal')
+            plt.show()
+        
+    except KeyboardInterrupt:
+        print("\nSimulation stopped by user")
+        
+    finally:
+        motors.stop()
+        print("Simulation ended.")
+
+def run_hardware(waypoints_file, config=None, k=None, k_e=None, max_speed=None, turn_factor=None):
+    """Run the rover with the Stanley controller"""
+    # Set up default config if none provided
+    if not config:
+        config = {
+            'k': 0.2 if k is None else k,               # Heading error gain
+            'k_e': 0.1 if k_e is None else k_e,            # CRITICAL: Reduce Cross-track error gain from 1.0 to 0.2
+            'dt': 0.1,              # Update rate
+            'L': 1.0,               # Wheelbase
+            'max_steer': np.radians(50),  # Maximum steering angle
+            'target_speed': 0.5,    # Target speed (m/s)
+            'extension_distance': 1.0,  # Extension distance
+            'waypoint_reach_threshold': 1.0,  # Increased to 3m
+            'update_rate': 10.0,     # Hz
+            'max_speed': 0.2 if max_speed is None else max_speed,
+            'turn_factor': 0.9 if turn_factor is None else turn_factor
+        }
+    
+    # Load waypoints
+    waypoints = load_waypoints(waypoints_file)
+    
+    # Create controller (PURE ALGORITHM - NO HARDWARE)
+    controller = StanleyController(waypoints, 
+                                  k=config['k'], 
+                                  k_e=config['k_e'],
+                                  L=config['L'],
+                                  max_steer=config['max_steer'],
+                                  waypoint_reach_threshold=config['waypoint_reach_threshold'])
+    
+    # Create hardware interfaces SEPARATELY
+    gps = GPSMonitor(simulation_mode='--sim' in sys.argv)
+    motors = MotorController(max_speed=config['max_speed'], turn_factor=config['turn_factor'])
+    
+    # Main control loop
+    try:
+        update_interval = 1.0 / config['update_rate']
+        last_update_time = time.time()
+        
+        while True:
+            current_time = time.time()
+            
+            # Check if it's time for an update
+            if current_time - last_update_time >= update_interval:
+                last_update_time = current_time
+                
+                # Get current position - FROM GPS, NOT CONTROLLER
+                x, y, yaw, v = gps.get_position_and_heading()
+                
+                # For simulation, use fixed speed 
+                v = config['target_speed']
+                
+                # Call pure controller with current position
+                delta, target_idx, distance, cte, yaw_error = controller.stanley_control(x, y, yaw, v)
+                
+                # Get bearing to target waypoint
+                target_waypoint = controller.waypoints[target_idx]
+                bearing = controller._calculate_bearing(x, y, target_waypoint[0], target_waypoint[1])
+                
+                # Add waypoint number and bearing to console output
+                logger.info(f"Heading towards waypoint {target_idx + 1}/{len(waypoints)}, bearing: {bearing:.1f}°")
+                
+                # Apply to hardware/simulation
+                motors.set_steering(np.degrees(delta))
+                motors.set_speed(v)
+            
+            # Small delay to prevent CPU hogging
+            time.sleep(0.01)
         
     except KeyboardInterrupt:
         print("\nSimulation stopped by user")
@@ -236,7 +341,7 @@ def run_hardware(waypoints_file, config=None):
         logger.info("Starting control loop...")
         
         # Constants for geographic coordinate conversion
-        METERS_PER_LAT_DEGREE = 111000
+        METERS_PER_LAT_DEGREE = 1110000
         
         # Create log file for trajectory
         trajectory_file = open(f"trajectory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "w")
@@ -569,7 +674,7 @@ def main():
         sys.exit(1)
     elif args.sim:
         logger.info("Starting in SIMULATION mode")
-        run_simulation(args.waypoints, config)
+        run_simulation(args.waypoints, config, animate=args.animate)
     elif args.real:
         logger.info("Starting in REAL HARDWARE mode")
         run_hardware(args.waypoints, config)

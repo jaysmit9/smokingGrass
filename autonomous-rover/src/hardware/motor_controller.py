@@ -11,10 +11,11 @@ logger = logging.getLogger(__name__)
 _motor_controller_instance = None
 
 class MotorController:
-    def __init__(self, max_speed=0.2, turn_factor=0.9):
+    def __init__(self, max_speed=0.2, turn_factor=0.9, simulation_mode=False):
         """Initialize the motor controller with configuration parameters."""
         self.max_speed = max_speed
         self.turn_factor = turn_factor
+        self.simulation_mode = simulation_mode
         self.left_speed = 0.0
         self.right_speed = 0.0
         self.current_steering = 0.0
@@ -185,7 +186,7 @@ class MotorController:
 def get_motor_controller():
     """Get or create the singleton motor controller instance."""
     global _motor_controller_instance
-    if _motor_controller_instance is None:
+    if (_motor_controller_instance is None):
         _motor_controller_instance = MotorController()
     return _motor_controller_instance
 

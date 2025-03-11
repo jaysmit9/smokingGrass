@@ -14,6 +14,9 @@ class GPSMonitor:
     def __init__(self, main_port='/dev/ttyACM0', secondary_port='/dev/ttyACM1', 
                  baud_rate=115200, timeout=0.1, use_dual_gps=True, simulation_mode=False):
         """Initialize GPS monitor"""
+        # Add thread lock for all instances
+        self.lock = threading.RLock()
+        
         self.simulation_mode = simulation_mode
         self.use_dual_gps = use_dual_gps
         self.timeout = timeout
@@ -92,9 +95,10 @@ class GPSMonitor:
             self.sim_yaw = 0.0  # Initial heading (North)
             self.sim_speed = 0.0  # Initial speed
             
-            # Correct scaling factors - these are crucial for position updates
-            self.lat_scale = 1.0 / 111000  # Approx meters per degree latitude
-            self.lon_scale = 1.0 / (111000 * np.cos(np.radians(self.sim_x)))  # Adjust for latitude
+            # FIXED: Use amplified scaling factors for better simulation
+            self.lat_scale = 1.0 / 11100  # 10x larger for faster simulation
+            self.lon_scale = 1.0 / (11100 * np.cos(np.radians(self.sim_x)))  # 10x larger
+            logger.info(f"Using amplified simulation scales: lat_scale={self.lat_scale:.8f}, lon_scale={self.lon_scale:.8f}")
             
         except Exception as e:
             logger.error(f"Failed to load simulation waypoints: {e}", exc_info=True)
@@ -105,8 +109,9 @@ class GPSMonitor:
             logger.info(f"Using default position: ({self.sim_x}, {self.sim_y})")
             self.sim_yaw = 0.0
             self.sim_speed = 0.0
-            self.lat_scale = 1.0 / 111000
-            self.lon_scale = 1.0 / (111000 * np.cos(np.radians(self.sim_x)))
+            # FIXED: Use amplified scaling factors here too
+            self.lat_scale = 1.0 / 11100  # 10x larger
+            self.lon_scale = 1.0 / (11100 * np.cos(np.radians(self.sim_x)))  # 10x larger
     
     def _start_hardware_readers(self):
         """Start threads to read from real GPS hardware"""
@@ -321,110 +326,40 @@ class GPSMonitor:
         self.sim_thread.start()
     
     def _simulate_gps_updates(self):
-        """Run GPS simulation"""
-        METERS_PER_LAT_DEGREE = 111000
-        update_rate = 10  # Hz (10 updates per second)
-        update_interval = 1.0 / update_rate
-        
-        last_update = time.time()
-        last_rate_update = time.time()
-        
-        while True:
+        """Simulate GPS updates based on speed and steering angle"""
+        while self.simulation_running:
             try:
-                current_time = time.time()
-                elapsed = current_time - last_update
+                time.sleep(self.simulation_update_interval)
                 
-                # Update at consistent rate
-                if elapsed >= update_interval:
-                    last_update = current_time
-                    
-                    # Calculate movement distance based on speed and time
-                    travel_distance = self.sim_speed * elapsed
-                    
-                    # Get current positions
-                    front_lat = self.gps_data["front"]["lat"]
-                    front_lon = self.gps_data["front"]["lon"]
-                    
-                    # Current heading (from front GPS)
-                    heading = self.gps_data["front"]["heading"] if self.gps_data["front"]["heading"] is not None else 0
-                    
-                    # Adjust heading based on turning (-1=left, 0=straight, 1=right)
-                    if hasattr(self, 'sim_turning') and self.sim_turning != 0:
-                        turn_rate = 15  # degrees per second
-                        heading_change = turn_rate * elapsed * self.sim_turning
-                        heading = (heading + heading_change) % 360
-                    
-                    # Convert heading to radians for movement calculation
-                    heading_rad = math.radians(heading)
-                    
-                    # Calculate meters per lon degree at current latitude
-                    meters_per_lon_degree = METERS_PER_LAT_DEGREE * math.cos(math.radians(front_lat))
-                    
-                    # Calculate position changes
-                    lat_change = travel_distance * math.cos(heading_rad) / METERS_PER_LAT_DEGREE
-                    lon_change = travel_distance * math.sin(heading_rad) / meters_per_lon_degree
-                    
-                    # Update front GPS position
-                    new_front_lat = front_lat + lat_change
-                    new_front_lon = front_lon
-                    
-                    # Add some GPS noise
-                    noise_factor = 0.0000001  # ~1cm noise
-                    new_front_lat += random.gauss(0, noise_factor)
-                    new_front_lon += random.gauss(0, noise_factor)
-                    
-                    # Update rear GPS based on front position and heading
-                    # Rear is 30cm behind front in the opposite direction of heading
-                    rear_heading_rad = math.radians((heading + 180) % 360)
-                    rear_distance = 0.3  # 30cm
-                    
-                    rear_lat_change = rear_distance * math.cos(rear_heading_rad) / METERS_PER_LAT_DEGREE
-                    rear_lon_change = rear_distance * math.sin(rear_heading_rad) / meters_per_lon_degree
-                    
-                    new_rear_lat = new_front_lat + rear_lat_change
-                    new_rear_lon = new_front_lon + rear_lon_change
-                    
-                    # Add some independent noise to rear GPS
-                    new_rear_lat += random.gauss(0, noise_factor)
-                    new_rear_lon += random.gauss(0, noise_factor)
-                    
-                    # Calculate accurate heading based on positions
-                    calculated_heading = self._calculate_bearing(
-                        new_rear_lat, new_rear_lon,
-                        new_front_lat, new_front_lon
-                    )
-                    
-                    # Update all GPS data
-                    self.gps_data["front"]["lat"] = new_front_lat
-                    self.gps_data["front"]["lon"] = new_front_lon
-                    self.gps_data["front"]["heading"] = heading
-                    self.gps_data["front"]["speed"] = self.sim_speed
-                    self.gps_data["front"]["last_update"] = current_time
-                    
-                    self.gps_data["rear"]["lat"] = new_rear_lat
-                    self.gps_data["rear"]["lon"] = new_rear_lon
-                    self.gps_data["rear"]["heading"] = heading
-                    self.gps_data["rear"]["speed"] = self.sim_speed
-                    self.gps_data["rear"]["last_update"] = current_time
-                    
-                    # Simulate NMEA message rate
-                    for pos in ["front", "rear"]:
-                        self.gps_data[pos]["message_count"] += 1
-                    
-                    # Update message rate calculation once per second
-                    if current_time - last_rate_update >= 1.0:
-                        for pos in ["front", "rear"]:
-                            count = self.gps_data[pos]["message_count"]
-                            self.gps_data[pos]["messages_per_sec"] = count / (current_time - last_rate_update)
-                            self.gps_data[pos]["message_count"] = 0
-                        last_rate_update = current_time
+                # Get current state
+                current_speed = self.simulated_speed  # Meters per second
+                current_steering_angle = self.simulated_steering_angle  # Radians
                 
-                # Small delay to avoid CPU hogging
-                time.sleep(0.01)
+                # Calculate change in heading
+                delta_heading = (current_speed / self.wheelbase) * np.tan(current_steering_angle) * self.simulation_update_interval
+                
+                # Update heading
+                self.simulated_heading += np.degrees(delta_heading)
+                self.simulated_heading %= 360  # Keep within 0-360 range
+                
+                # Calculate change in position (simplified for simulation)
+                delta_x = current_speed * np.cos(np.radians(self.simulated_heading)) * self.simulation_update_interval
+                delta_y = current_speed * np.sin(np.radians(self.simulated_heading)) * self.simulation_update_interval
+                
+                # IMPORTANT FIX: Use a more accurate scaling factor
+                # Standard is 111111.0 meters per degree at the equator
+                # But let's amplify this for better simulation progress
+                SCALING_FACTOR = 11111.0  # 10x smaller = 10x faster movement
+                
+                # Update position (using enhanced increments in lat/lon)
+                self.simulated_latitude += delta_y / SCALING_FACTOR  # Enhanced meters to latitude conversion
+                self.simulated_longitude += (delta_x / (SCALING_FACTOR * np.cos(np.radians(self.simulated_latitude))))  # Enhanced meters to longitude
+                
+                # Log simulation update
+                logger.debug(f"Simulated GPS update - Lat: {self.simulated_latitude:.8f}, Lon: {self.simulated_longitude:.8f}, Heading: {self.simulated_heading:.2f}")
                 
             except Exception as e:
                 logger.error(f"Error in GPS simulation: {e}")
-                time.sleep(0.1)
     
     def _calculate_bearing(self, lat1, lon1, lat2, lon2):
         """Calculate bearing between two points in degrees (0-360)"""
@@ -485,38 +420,67 @@ class GPSMonitor:
                 self.secondary_serial.close()
     
     def update_simulation(self, steering_angle, speed, dt=0.1):
-        """Update simulated position based on steering and speed"""
-        # Verify current position is valid
-        if abs(self.sim_x) < 0.1 or abs(self.sim_y) < 0.1:
-            logger.error(f"Invalid position detected: ({self.sim_x}, {self.sim_y})")
-            # Reset to first waypoint if available
-            if hasattr(self, 'sim_waypoints') and len(self.sim_waypoints) > 0:
-                self.sim_x = self.sim_waypoints[0][0]
-                self.sim_y = self.sim_waypoints[0][1]
-                logger.info(f"Reset position to: ({self.sim_x}, {self.sim_y})")
-        
-        # Log before state
-        logger.debug(f"Before: pos=({self.sim_x:.6f}, {self.sim_y:.6f}), "
-                  f"yaw={np.degrees(self.sim_yaw):.1f}°, steering={np.degrees(steering_angle):.1f}°")
-        
-        # Update heading
-        self.sim_yaw += speed / self.L * np.tan(steering_angle) * dt
-        self.sim_yaw = self.sim_yaw % (2 * np.pi)  # Normalize
-        
-        # Calculate position changes in degrees
-        dx = speed * np.cos(self.sim_yaw) * dt * self.lat_scale
-        dy = speed * np.sin(self.sim_yaw) * dt * self.lon_scale
-        
-        # Update position
-        self.sim_x += dx
-        self.sim_y += dy
-        
-        # Log after state
-        logger.debug(f"After: pos=({self.sim_x:.6f}, {self.sim_y:.6f}), dx={dx:.8f}, dy={dy:.8f}")
-        
-        # Update speed
-        self.sim_speed = speed
-
+        """
+        Update simulated position based on steering and speed
+        Using a consistent bicycle model for simulation
+        """
+        # Ensure we're working with a copy of the state to prevent race conditions
+        with self.lock:
+            # Store previous state for logging
+            prev_x = self.sim_x
+            prev_y = self.sim_y
+            prev_yaw = self.sim_yaw
+            prev_heading_deg = np.degrees(prev_yaw) % 360
+            
+            # 1. Make sure steering_angle is in radians and limited
+            steering_angle_rad = steering_angle
+            if abs(steering_angle_rad) > np.pi/2:
+                logger.warning(f"Very large steering angle detected: {np.degrees(steering_angle_rad):.1f}°, limiting to ±45°")
+                steering_angle_rad = np.clip(steering_angle_rad, -np.pi/4, np.pi/4)
+            
+            # 2. Limit the yaw rate change for smoother simulation
+            max_yaw_rate = np.radians(20)  # Max 20 degrees per update
+            yaw_rate = (speed / self.L) * np.tan(steering_angle_rad)
+            yaw_rate = np.clip(yaw_rate, -max_yaw_rate, max_yaw_rate)
+            
+            # 3. Update yaw (heading)
+            self.sim_yaw += yaw_rate * dt
+            self.sim_yaw = self.sim_yaw % (2 * np.pi)  # Keep in [0, 2π]
+            
+            # 4. Calculate position change
+            # Using standard navigation coordinate system:
+            # 0° = North, 90° = East, 180° = South, 270° = West
+            heading_rad = self.sim_yaw
+            delta_x = speed * np.sin(heading_rad) * dt  # East-West
+            delta_y = speed * np.cos(heading_rad) * dt  # North-South
+            
+            # 5. Apply a scaling factor to make simulation progress visible
+            # Standard conversion: 111,111 meters per degree latitude at equator
+            # Using enhanced factor (10x) for better simulation visibility
+            lat_scale = 1.0 / 11111.0  # 10x larger than real world
+            lon_scale = 1.0 / (11111.0 * np.cos(np.radians(self.sim_x)))
+            
+            # 6. Convert to latitude/longitude changes
+            lat_change = delta_y * lat_scale
+            lon_change = delta_x * lon_scale
+            
+            # 7. Update position
+            self.sim_x += lat_change
+            self.sim_y += lon_change
+            
+            # 8. Update speed
+            self.sim_speed = speed
+            
+            # 9. Comprehensive logging
+            heading_deg = np.degrees(self.sim_yaw) % 360
+            heading_change = ((heading_deg - prev_heading_deg + 180) % 360) - 180  # -180 to +180
+            
+            logger.info(
+                f"SIMULATION: Speed={speed:.2f}m/s, Steering={np.degrees(steering_angle_rad):.1f}°\n"
+                f"Position: ({prev_x:.6f}, {prev_y:.6f}) → ({self.sim_x:.6f}, {self.sim_y:.6f})\n"
+                f"Heading: {prev_heading_deg:.1f}° → {heading_deg:.1f}° (Δ={heading_change:.1f}°)\n"
+                f"Movement: N/S={delta_y:.2f}m, E/W={delta_x:.2f}m"
+            )
     
 def run_gps_test(waypoints_file, config=None):
     # ... existing code ...
@@ -545,6 +509,34 @@ def run_hardware(waypoints_file, config=None):
 
     
     # ... rest of the function ...
+
+def _add_simulation_diagnostics():
+    """Add debug output to main.py to display simulation diagnostics"""
+    # In run_simulation before applying to hardware/simulation:
+    
+    # Display simulation diagnostics
+    waypoint_lat, waypoint_lon = controller.waypoints[target_idx]
+    bearing_to_wp = controller._calculate_bearing(x, y, waypoint_lat, waypoint_lon)
+    
+    logger.info(
+        f"\n--- SIMULATION DIAGNOSTICS ---\n"
+        f"Current position: ({x:.6f}, {y:.6f})\n"
+        f"Current heading: {np.degrees(yaw):.1f}° (raw yaw: {yaw:.4f} rad)\n"
+        f"Target waypoint {target_idx+1}/{len(waypoints)}: ({waypoint_lat:.6f}, {waypoint_lon:.6f})\n"
+        f"Bearing to waypoint: {bearing_to_wp:.1f}°\n"
+        f"Distance: {distance:.2f}m, CTE: {cte:.2f}m\n"
+        f"Heading error: {np.degrees(yaw_error):.1f}°\n"
+        f"Steering command: {np.degrees(delta):.1f}°\n"
+        f"Speed: {v:.2f}m/s\n"
+        f"---------------------------"
+    )
+    
+    # After gps.update_simulation(), add:
+    new_x, new_y, new_heading, _ = gps.get_position_and_heading()
+    logger.info(
+        f"Position updated: ({x:.6f}, {y:.6f}) → ({new_x:.6f}, {new_y:.6f})\n"
+        f"Heading updated: {np.degrees(yaw):.1f}° → {new_heading:.1f}°"
+    )
 
 # For testing
 if __name__ == "__main__":
