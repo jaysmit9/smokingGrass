@@ -11,6 +11,10 @@ from geopy.distance import geodesic  # Add this import for geodesic calculations
 # Import Stanley controller components
 from controllers.stanley_controller import StanleyController
 
+# Import hardware components
+from hardware.gps_monitor import GPSMonitor  # Add this import
+from hardware.motor_controller import get_motor_controller  # Add this import
+
 # Conditionally import visualization modules for simulation mode
 try:
     import matplotlib.pyplot as plt
@@ -31,31 +35,51 @@ logging.basicConfig(
 logger = logging.getLogger("rover")
 
 def load_waypoints(waypoints_file):
-    """Load waypoints from a JSON file"""
+    """Load waypoints from file with better validation."""
     try:
-        # Construct absolute path to the data directory
-        if not os.path.isabs(waypoints_file):
-            # Get the directory where the script is located
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            # Go up one level to the project root
-            project_root = os.path.dirname(script_dir)
-            # Construct the full path to the waypoints file
-            full_path = os.path.join(project_root, "data", waypoints_file)
+        logger.info(f"Loading waypoints from: {waypoints_file}")
+        waypoints = []
+        
+        # Determine file type and load accordingly
+        if waypoints_file.endswith('.json'):
+            with open(waypoints_file, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) > 0:
+                    # Extract waypoints based on format
+                    if isinstance(data[0], list):  # Simple format [[lat, lon], ...]
+                        waypoints = np.array(data, dtype=np.float64)
+                    elif isinstance(data[0], dict) and 'lat' in data[0] and 'lon' in data[0]:
+                        waypoints = np.array([[point['lat'], point['lon']] for point in data], dtype=np.float64)
         else:
-            full_path = waypoints_file
+            # Assume it's a CSV or similar text format
+            with open(waypoints_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split(',')
+                    if len(parts) >= 2:
+                        try:
+                            lat = float(parts[0])
+                            lon = float(parts[1])
+                            waypoints.append([lat, lon])
+                        except ValueError:
+                            continue
+            waypoints = np.array(waypoints, dtype=np.float64)
+        
+        # Validate waypoints
+        if len(waypoints) < 2:
+            logger.error(f"Not enough valid waypoints found (need at least 2, found {len(waypoints)})")
+            return np.array([[0, 0], [0.0001, 0.0001]])  # Provide dummy waypoints
+        
+        # Log all waypoints after loading (IMPORTANT)
+        logger.info(f"Successfully loaded {len(waypoints)} waypoints:")
+        for i, wp in enumerate(waypoints):
+            logger.info(f"WP {i}: ({wp[0]:.7f}, {wp[1]:.7f})")
             
-        logger.info(f"Loading waypoints from: {full_path}")
-        
-        with open(full_path) as f:
-            data = json.load(f)
-        
-        # Extract coordinates from data
-        waypoints = np.array([(point['lat'], point['lon']) for point in data])
-        logger.info(f"Loaded {len(waypoints)} waypoints from {waypoints_file}")
         return waypoints
+        
     except Exception as e:
-        logger.error(f"Failed to load waypoints: {e}")
-        sys.exit(1)
+        logger.error(f"Error loading waypoints: {e}")
+        # Return dummy waypoints if loading fails
+        return np.array([[0, 0], [0.0001, 0.0001]])
 
 def run_simulation(waypoints_file, config=None):
     """Run the rover in simulation mode"""
@@ -63,33 +87,32 @@ def run_simulation(waypoints_file, config=None):
         logger.error("Matplotlib is required for simulation mode")
         return
     
-    # Default configuration
+    # Default configuration updated for tanh-based controller
     if config is None:
         config = {
-            'k': 15.8,                      # Stanley gain for heading error
-            'k_e': 13.0,                   # Stanley gain for cross-track error
-            'dt': 0.1,                     # Time step (seconds)
-            'L': 1.0,                      # Wheelbase (meters)
-            'max_steer': np.radians(90),   # Maximum steering angle
-            'target_speed': 1.0,           # Target speed (m/s)
-            'extension_distance': 1.0,     # Extension distance beyond final waypoint
-            'waypoint_reach_threshold': 1.0  # Distance threshold to consider waypoint reached
+            'dt': 0.1,                      # Time step (seconds)
+            'max_steer': np.radians(90),    # Maximum steering angle
+            'target_speed': 1.0,            # Target speed (m/s)
+            'extension_distance': 1.0,      # Extension distance beyond final waypoint
+            'waypoint_reach_threshold': 1.0, # Distance threshold to consider waypoint reached
+            'steering_sensitivity': np.pi/36  # Denominator for tanh function (lower = more aggressive)
         }
     
     # Load waypoints
     waypoints = load_waypoints(waypoints_file)
     
-    # Add extension waypoint
+    # Initialize the controller with new parameters
     controller = StanleyController(
-        waypoints, 
-        k=config['k'], 
-        k_e=config['k_e'], 
-        L=config['L'], 
+        waypoints=waypoints,
         max_steer=config['max_steer'],
-        waypoint_reach_threshold=config['waypoint_reach_threshold']
+        waypoint_reach_threshold=config['waypoint_reach_threshold'],
+        steering_sensitivity=config.get('steering_sensitivity', np.pi/3)
     )
+    
+    # Add extension waypoint
     waypoints = controller.add_extension_waypoint(config['extension_distance'])
     
+    # Rest of the function remains the same
     # Initial state setup
     x = waypoints[0, 0]  # Initial latitude
     y = waypoints[0, 1]  # Initial longitude
@@ -112,15 +135,110 @@ def run_simulation(waypoints_file, config=None):
     results = simulate(
         waypoints, x, y, yaw, v, 
         target_idx=1,  # Start with second waypoint as target
-        k=config['k'], 
-        k_e=config['k_e'],
         target_speed=config['target_speed'],
         dt=config['dt'],
-        L=config['L'],
         max_steer=config['max_steer'],
+        steering_sensitivity=config['steering_sensitivity'],  # New parameter
         waypoint_reach_threshold=config['waypoint_reach_threshold'],
         METERS_PER_LAT_DEGREE=METERS_PER_LAT_DEGREE
     )
+    
+    # Check if we should replay the simulation with progress logs
+    replay_simulation = '--replay' in sys.argv
+    
+    if replay_simulation:
+        logger.info("Replaying simulation with progress logging...")
+        replay_duration = min(30.0, len(results['time']) * config['dt'])  # Max 30 seconds of replay
+        replay_interval = 0.1  # Update every 100ms
+        
+        # Calculate how many steps to skip to fit within replay_duration
+        total_steps = len(results['time'])
+        step_skip = max(1, int(total_steps * replay_interval / replay_duration))
+        
+        # Create a trajectory file for the simulation too
+        trajectory_file = open(f"sim_trajectory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "w")
+        trajectory_file.write("timestamp,lat,lon,heading,speed,target_idx,distance,cte\n")
+        
+        last_progress_log_time = time.time()
+        
+        for i in range(0, total_steps, step_skip):
+            # Get state at this step
+            x = results['x'][i]
+            y = results['y'][i]
+            yaw = results['yaw'][i]
+            v = results['v'][i]
+            target_idx = results['target_idx'][i]
+            delta = results['delta'][i]
+            cte = results['cte'][i]
+            
+            # Get distance to current waypoint
+            if target_idx < len(waypoints):
+                target_wp = waypoints[target_idx]
+                distance = geodesic((x, y), (target_wp[0], target_wp[1])).meters
+            else:
+                distance = 0.0
+            
+            # Convert yaw to heading (0-360 degrees)
+            heading = (np.degrees(yaw) + 360) % 360
+            
+            # Convert steering angle to degrees
+            steering_degrees = np.degrees(delta)
+            
+            # Write to trajectory file
+            current_time = time.time()
+            trajectory_file.write(f"{current_time},{x},{y},{heading},"
+                                 f"{v},{target_idx},{distance},{cte}\n")
+            
+            # Progress logging (once per second)
+            if current_time - last_progress_log_time >= 1.0:
+                last_progress_log_time = current_time
+                
+                # Calculate percentage to next waypoint if we know the previous waypoint
+                progress_percent = "unknown"
+                if target_idx > 0 and target_idx < len(waypoints):
+                    # Calculate distance between previous and current waypoint
+                    prev_wp = waypoints[target_idx - 1]
+                    target_wp = waypoints[target_idx]
+                    total_segment_dist = geodesic((prev_wp[0], prev_wp[1]), 
+                                                (target_wp[0], target_wp[1])).meters
+                    
+                    # Calculate progress percentage
+                    if total_segment_dist > 0:
+                        dist_from_prev = geodesic((prev_wp[0], prev_wp[1]), 
+                                                (x, y)).meters
+                        progress = min(100, (dist_from_prev / total_segment_dist) * 100)
+                        progress_percent = f"{progress:.1f}%"
+                
+                # Get bearing to target waypoint
+                if target_idx < len(waypoints):
+                    target_wp = waypoints[target_idx]
+                    bearing_to_target = calculate_bearing(x, y, target_wp[0], target_wp[1])
+                    
+                    # Create progress bar
+                    progress_bar_len = 20
+                    if distance > 0:
+                        threshold = config['waypoint_reach_threshold']
+                        progress_normalized = min(1.0, max(0, (threshold - min(threshold, distance)) / threshold))
+                        filled = int(progress_normalized * progress_bar_len)
+                        progress_bar = f"[{'#' * filled}{'-' * (progress_bar_len - filled)}]"
+                    else:
+                        progress_bar = "[--------------------]"
+                    
+                    logger.info(f"\n===== SIMULATION PROGRESS =====")
+                    logger.info(f"Waypoint: {target_idx}/{len(waypoints)-1} {progress_bar}")
+                    logger.info(f"Position: {x:.6f}, {y:.6f} | Progress: {progress_percent}")
+                    logger.info(f"Heading: {heading:.1f}° | Bearing to target: {bearing_to_target:.1f}°")
+                    logger.info(f"Distance to waypoint: {distance:.2f}m | Cross-track error: {cte:.2f}m")
+                    logger.info(f"Steering: {steering_degrees:.1f}° | Speed: {v:.2f} m/s")
+                    logger.info(f"Time step: {i}/{total_steps} ({i/total_steps*100:.1f}%)")
+                    logger.info(f"===============================")
+            
+            # Small delay to make the replay feel real-time
+            time.sleep(replay_interval)
+        
+        # Close trajectory file
+        trajectory_file.close()
+        logger.info("Replay completed")
     
     # Plot results
     plot_results(results, waypoints)
@@ -132,189 +250,234 @@ def run_simulation(waypoints_file, config=None):
     logger.info("Simulation completed")
 
 def run_hardware(waypoints_file, config=None):
-    """Run the rover with real hardware"""
-    logger.info("Starting in REAL HARDWARE mode")
-    
+    """Run the rover using real hardware"""
     # Default configuration
     if config is None:
         config = {
-            'k': 6.8,                      # Stanley gain for heading error
-            'k_e': 13.0,                   # Stanley gain for cross-track error
-            'dt': 0.1,                     # Time step (seconds)
-            'L': 1.0,                      # Wheelbase (meters)
-            'max_steer': np.radians(50),   # Maximum steering angle
-            'target_speed': 1.0,           # Target speed (m/s)
+            'max_steer': np.radians(90),   # Maximum steering angle
+            'target_speed': 0.30,          # Target speed (m/s)
+            'update_rate': 10,             # Control loop update rate (Hz)
             'extension_distance': 1.0,     # Extension distance beyond final waypoint
             'waypoint_reach_threshold': 1.0,  # Distance threshold to consider waypoint reached
-            'update_rate': 10.0            # Control loop update rate (Hz)
+            'steering_sensitivity': np.pi/3   # Denominator for tanh function
         }
     
-    # Load waypoints
-    waypoints = load_waypoints(waypoints_file)
-    
-    # Add extension waypoint
-    controller = StanleyController(
-        waypoints, 
-        k=config['k'], 
-        k_e=config['k_e'], 
-        L=config['L'], 
-        max_steer=config['max_steer'],
-        waypoint_reach_threshold=config['waypoint_reach_threshold']
-    )
-    waypoints = controller.add_extension_waypoint(config['extension_distance'])
-    
-    # Import hardware interfaces
     try:
-        from hardware.gps_monitor import GPSMonitor
-        from hardware.motor_controller import MotorController
-    except ImportError as e:
-        logger.error(f"Failed to import hardware modules: {e}")
-        logger.error("Make sure the hardware modules are in the Python path")
-        return
-    
-    # Initialize hardware
-    try:
-        # Initialize GPS with simulation mode EXPLICITLY OFF
-        gps = GPSMonitor(simulation_mode=False)  # <-- Force hardware mode
-        motors = MotorController()
-        
-        logger.info("Hardware initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize hardware: {e}")
-        return
-    
-    # Wait for valid GPS signal
-    logger.info("Waiting for valid GPS position...")
-    position_valid = False
-    
-    while not position_valid:
-        try:
-            lat, lon, heading, speed = gps.get_position_and_heading()
-            if lat is not None and lon is not None and heading is not None:
-                position_valid = True
-                logger.info(f"Valid GPS position obtained: {lat}, {lon}, heading: {heading}°")
+        # CRITICAL FIX: Make sure waypoints_file exists and is the absolute path
+        if not os.path.isabs(waypoints_file):
+            # Check current directory
+            if os.path.exists(waypoints_file):
+                waypoints_file = os.path.abspath(waypoints_file)
             else:
-                logger.warning("No valid GPS position yet, retrying...")
-                time.sleep(1)
-        except Exception as e:
-            logger.error(f"Error getting GPS position: {e}")
-            time.sleep(1)
-    
-    # Initial state
-    x = lat
-    y = lon
-    yaw = np.radians(heading)  # Convert heading from degrees to radians
-    v = speed
-    
-    # Control loop
-    target_idx = 1  # Start with second waypoint as target
-    last_update_time = time.time()
-    update_interval = 1.0 / config['update_rate']
-    
-    try:
-        logger.info("Starting control loop...")
+                # Try data subdirectory
+                data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", waypoints_file)
+                if os.path.exists(data_path):
+                    waypoints_file = data_path
+                else:
+                    # Try parent's data directory
+                    parent_data_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", waypoints_file)
+                    if os.path.exists(parent_data_path):
+                        waypoints_file = parent_data_path
         
-        # Constants for geographic coordinate conversion
-        METERS_PER_LAT_DEGREE = 111000
+        # CRITICAL: Check if the file exists now
+        if not os.path.exists(waypoints_file):
+            logger.critical(f"ERROR: Waypoints file {waypoints_file} not found!")
+            logger.critical("Please specify an existing waypoints file with --waypoints.")
+            return
         
-        # Create log file for trajectory
+        logger.critical(f"Using waypoints file: {waypoints_file}")
+        
+        # Load waypoints directly from the file to guarantee it works
+        with open(waypoints_file, 'r') as f:
+            logger.critical(f"Successfully opened waypoints file")
+            raw_data = f.read()
+            logger.critical(f"Raw file content (first 100 chars): {raw_data[:100]}...")
+            
+            data = json.loads(raw_data)
+            if isinstance(data, list) and len(data) > 0:
+                # Directly load waypoints based on format
+                if isinstance(data[0], list):  # Simple format [[lat, lon], ...]
+                    waypoints = np.array(data, dtype=np.float64)
+                elif isinstance(data[0], dict) and 'lat' in data[0] and 'lon' in data[0]:
+                    waypoints = np.array([[point['lat'], point['lon']] for point in data], dtype=np.float64)
+                else:
+                    logger.critical(f"Unknown waypoint format: {data[0]}")
+                    return
+            else:
+                logger.critical("Waypoints file doesn't contain an array or is empty.")
+                return
+        
+        # Check loaded waypoints
+        logger.critical("==== LOADED WAYPOINTS ====")
+        for i, wp in enumerate(waypoints):
+            logger.critical(f"WP {i}: ({wp[0]:.7f}, {wp[1]:.7f})")
+        logger.critical("========================")
+        
+        # Create controller AFTER successfully loading waypoints
+        controller = StanleyController(
+            waypoints=waypoints,
+            max_steer=config['max_steer'],
+            waypoint_reach_threshold=config['waypoint_reach_threshold'],
+            steering_sensitivity=config['steering_sensitivity']
+        )
+        
+        # VERIFY controller's waypoints are correct
+        logger.critical("==== CONTROLLER WAYPOINTS ====")
+        for i in range(len(controller.waypoints)):
+            logger.critical(f"WP {i}: ({controller.waypoints[i][0]:.7f}, {controller.waypoints[i][1]:.7f})")
+        logger.critical("========================")
+        
+        # Initialize GPS and motor controller
+        gps = GPSMonitor()
+        motors = get_motor_controller(max_speed=0.3)  # Set to 0.3 explicitly
+
+        # IMPORTANT: Add debugging to verify it took effect
+        logger.critical(f"MOTOR CONTROLLER MAX SPEED: {motors.max_speed}")
+        
+        # Constants
+        update_interval = 1.0 / config['update_rate']
+        last_update_time = 0
+        
+        # Create trajectory file
         trajectory_file = open(f"trajectory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "w")
         trajectory_file.write("timestamp,lat,lon,heading,speed,target_idx,distance,cte\n")
         
-        # Add this at the beginning of the run_hardware control loop
-        # (after creating motors but before the control loop starts)
-        # This will help us see where set_speed is being called
-
-        import traceback
-
-        # Monkey patch the set_speed method to add more detailed logging
-        original_set_speed = motors.set_speed
-
-        def set_speed_with_trace(speed):
-            stack = traceback.extract_stack()
-            caller = stack[-2]  # The function that called this one
-            logger.info(f"set_speed({speed}) called from {os.path.basename(caller.filename)}:{caller.lineno}")
-            return original_set_speed(speed)
-
-        motors.set_speed = set_speed_with_trace
+        logger.info("Starting hardware control loop. Press Ctrl+C to stop.")
         
-        # Control loop
-        while True:
-            current_time = time.time()
-            
-            # Check if it's time for an update
-            if current_time - last_update_time >= update_interval:
-                last_update_time = current_time
+        try:
+            while True:
+                current_time = time.time()
                 
-                try:
-                    # Add this debug call before getting steering command
-                    debug_heading(gps, controller, waypoints)
+                # Check if it's time for an update
+                if current_time - last_update_time >= update_interval:
+                    last_update_time = current_time
                     
-                    # Get GPS data
-                    lat, lon, heading, speed = gps.get_position_and_heading()
-                    
-                    # NO CHANGE TO HEADING - this is critical
-                    x = lat
-                    y = lon
-                    yaw = np.radians(heading)  # Convert to radians without changing coordinate system
-                    v = speed
-                    
-                    # Get steering command from Stanley controller
-                    delta, target_idx, distance, cte, yaw_error = controller.stanley_control(x, y, yaw, v)
-                    
-                    # Limit steering angle
-                    delta = np.clip(delta, -config['max_steer'], config['max_steer'])
-                    
-                    # Adjust speed based on steering angle (just calculate it, don't apply yet)
-                    current_target_speed = config['target_speed']
-                    if abs(delta) > np.radians(30):
-                        current_target_speed *= 0.5  # Slow down for sharp turns
-                    elif abs(delta) > np.radians(15):
-                        current_target_speed *= 0.7  # Moderate speed for moderate turns
-
-                    # Convert steering angle to degrees for the motor controller
-                    steering_degrees = np.degrees(delta)
-
-                    # Apply steering ONCE (and only once)
-                    motors.set_steering(steering_degrees)
-                    motors.set_heading_error(np.degrees(yaw_error))  # Store heading error for logging
-                    
-                    # Get motor status for logging
-                    motor_status = motors.get_status()
-                    
-                    # Enhanced logging with clear heading information
-                    logger.info(f"Pos: ({lat:.6f}, {lon:.6f}), Heading: {heading:.1f}°, "
-                                f"Target: {target_idx}/{len(waypoints)-1}, "
-                                f"Distance: {distance:.1f}m, CTE: {cte:.2f}m, "
-                                f"Heading Error: {np.degrees(yaw_error):.1f}°, "
-                                f"Steering: {np.degrees(delta):.1f}°")
-                    
-                    # Write to trajectory file
-                    trajectory_file.write(f"{current_time},{lat},{lon},{heading},"
-                                         f"{speed},{target_idx},{distance},{cte}\n")
-                    trajectory_file.flush()
-                    
-                    # Check if we've reached the final waypoint (which is the extension point)
-                    if target_idx == len(waypoints) - 1 and distance < config['waypoint_reach_threshold']:
-                        logger.info("✓✓ REACHED FINAL WAYPOINT")
-                        motors.stop()
-                        break
+                    try:
+                        # Add this debug call before getting steering command
+                        debug_heading(gps, controller, waypoints)
                         
-                except Exception as e:
-                    logger.error(f"Error in control loop: {e}")
-                    motors.stop()
-                    time.sleep(1)  # Brief pause before retrying
-            
-            # Small delay to prevent CPU hogging
-            time.sleep(0.01)
-            
-    except KeyboardInterrupt:
-        logger.info("Control loop interrupted by user")
-    finally:
-        # Clean up
-        logger.info("Stopping motors and cleaning up...")
-        motors.stop()
-        trajectory_file.close()
+                        # Get GPS data
+                        lat, lon, heading, speed = gps.get_position_and_heading()
+                        
+                        if lat is not None and lon is not None and heading is not None:
+                            # DEBUG - Print the target coordinates and the bearing calculation steps
+                            logger.warning("=== COORDINATE DEBUG ===")
+                            logger.warning(f"Current position: ({lat:.7f}, {lon:.7f}), Heading: {heading:.1f}°")
+                            
+                            # Get current target from controller
+                            target_idx = controller.target_idx
+                            if target_idx < len(waypoints):
+                                tx, ty = waypoints[target_idx]
+                                logger.warning(f"Target waypoint {target_idx}: ({tx:.7f}, {ty:.7f})")
+                                
+                                # Calculate bearing using our consistent method (same as map_visualizer)
+                                import math
+                                lat1_rad = math.radians(lat)
+                                lon1_rad = math.radians(lon)
+                                lat2_rad = math.radians(tx) 
+                                lon2_rad = math.radians(ty)
+                                
+                                dlon = lon2_rad - lon1_rad
+                                y_val = math.sin(dlon) * math.cos(lat2_rad)
+                                x_val = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon)
+                                bearing_rad = math.atan2(y_val, x_val)
+                                bearing_deg = math.degrees(bearing_rad)
+                                bearing_deg = (bearing_deg + 360) % 360
+                                
+                                logger.warning(f"DIRECT BEARING CALCULATION: {bearing_deg:.1f}°")
+                                
+                                # Compare with controller's calculation
+                                controller_bearing = controller._calculate_bearing(lat, lon, tx, ty)
+                                logger.warning(f"CONTROLLER BEARING CALCULATION: {controller_bearing:.1f}°")
+                                
+                                # Also check if parameter order matters
+                                alt_bearing = controller._calculate_bearing(lat, lon, ty, tx)  # Swapped tx,ty
+                                logger.warning(f"WITH SWAPPED TARGET COORDS: {alt_bearing:.1f}°")
+                                
+                                # Check with swapped current position
+                                alt_bearing2 = controller._calculate_bearing(lon, lat, tx, ty)  # Swapped lat,lon
+                                logger.warning(f"WITH SWAPPED CURRENT COORDS: {alt_bearing2:.1f}°")
+                            
+                            logger.warning("=== END DEBUG ===")
+                        
+                        # Then continue with the original code
+                        yaw = np.radians(heading)
+                        # CRITICAL FIX: Swap the lat/lon parameters when calling stanley_control
+                        # The parameter expectation is (lon, lat, yaw, v) despite the x,y naming
+                        delta, target_idx, distance, cte, yaw_error = controller.stanley_control(lon, lat, yaw, speed)
+                        
+                        # Limit steering angle
+                        delta = np.clip(delta, -config['max_steer'], config['max_steer'])
+                        
+                        # Adjust speed based on steering angle (just calculate it, don't apply yet)
+                        current_target_speed = config['target_speed']
+                        if abs(delta) > np.radians(30):
+                            current_target_speed *= 0.5  # Slow down for sharp turns
+                        elif abs(delta) > np.radians(15):
+                            current_target_speed *= 0.7  # Moderate speed for moderate turns
+
+                        # Convert steering angle to degrees for the motor controller
+                        steering_degrees = np.degrees(delta)
+
+                        # Apply steering ONCE (and only once)
+                        motors.set_steering(steering_degrees)
+                        motors.set_heading_error(np.degrees(yaw_error))  # Store heading error for logging
+                        
+                        # IMPORTANT: Set the speed AFTER setting steering!
+                        motors.set_speed(current_target_speed)  # THIS WAS MISSING! Apply the calculated speed
+                        
+                        # Get motor status for logging
+                        motor_status = motors.get_status()
+                        
+                        # Write to trajectory file
+                        trajectory_file.write(f"{current_time},{lat},{lon},{heading},"
+                                             f"{speed},{target_idx},{distance},{cte}\n")
+                        trajectory_file.flush()
+                        
+                        # Check if we've reached the final waypoint (which is the extension point)
+                        if target_idx == len(waypoints) - 1 and distance < config['waypoint_reach_threshold']:
+                            logger.info("✓✓ REACHED FINAL WAYPOINT")
+                            motors.stop()
+                            break
+                            
+                        if lat is not None and lon is not None and heading is not None:
+                            # Calculate and show distance to target in a prominent way
+                            current_target_idx = controller.target_idx
+                            if current_target_idx < len(waypoints):
+                                target_lat, target_lon = waypoints[current_target_idx]
+                                distance_to_target = geodesic((lat, lon), (target_lat, target_lon)).meters
+                                
+                                # Create a visual distance indicator
+                                max_display_distance = 20.0  # meters
+                                display_dist = min(distance_to_target, max_display_distance)
+                                bar_length = 20
+                                filled = bar_length - int((display_dist / max_display_distance) * bar_length)
+                                distance_bar = f"[{'#' * filled}{'-' * (bar_length - filled)}]"
+                                
+                                # Print prominent distance banner
+                                logger.info("")
+                                logger.info(f"DISTANCE TO TARGET: {distance_to_target:.2f}m {distance_bar}")
+                                logger.info(f"WAYPOINT: {current_target_idx}/{len(waypoints)-1}")
+                                logger.info("")
+                        
+                    except Exception as e:
+                        logger.error(f"Error in control loop: {e}")
+                        motors.stop()
+                        time.sleep(1)  # Brief pause before retrying
+                
+                # Small delay to prevent CPU hogging
+                time.sleep(0.01)
+        
+        except KeyboardInterrupt:
+            logger.info("Manual stop requested")
+        
+        finally:
+            # Clean up
+            logger.info("Stopping motors and cleaning up...")
+            motors.stop()
+            trajectory_file.close()
+    except Exception as e:
+        logger.error(f"Error in run_hardware: {e}")
 
 # Add this helper function
 def debug_heading(gps, controller, waypoints):
@@ -322,7 +485,8 @@ def debug_heading(gps, controller, waypoints):
     lat, lon, heading, speed = gps.get_position_and_heading()
     
     if controller.target_idx < len(waypoints):
-        target = waypoints[controller.target_idx]
+        target_idx = controller.target_idx
+        target = waypoints[target_idx]
         
         # Calculate bearing to target
         bearing = controller._calculate_bearing(lat, lon, target[0], target[1])
@@ -335,66 +499,105 @@ def debug_heading(gps, controller, waypoints):
         diff_rad = ((bearing_rad - heading_rad + np.pi) % (2 * np.pi)) - np.pi
         diff_deg = np.degrees(diff_rad)
         
-        # Print debugging info
-        logger.info(f"DEBUG - GPS Heading: {heading:.1f}°, "
+        # Get distance to target
+        dist = geodesic((lat, lon), (target[0], target[1])).meters
+        
+        # Print debugging info with prominent waypoint number
+        logger.info(f"DEBUG - TARGET WP: {target_idx} [{dist:.1f}m] | "
+                   f"GPS Heading: {heading:.1f}°, "
                    f"Bearing to target: {bearing:.1f}°, "
                    f"Needed turn: {diff_deg:.1f}° {'RIGHT' if diff_deg > 0 else 'LEFT'}")
 
 # Add this function to your main.py
 
 def run_gps_test(waypoints_file, config=None):
-    """
-    Run in GPS test mode - motors stay at 0, shows all GPS data
-    """
-    logger.info("Starting in GPS TEST mode (no motors)")
-    
-    # Load waypoints
-    waypoints = load_waypoints(waypoints_file)
-    logger.info(f"Loaded {len(waypoints)} waypoints from {os.path.basename(waypoints_file)}")
-    
-    # Initialize hardware but don't activate motors
+    """Test GPS readings and bearing calculations matching map visualizer"""
     try:
-        # Get GPS
-        from hardware.gps_monitor import GPSMonitor
-        gps = GPSMonitor(simulation_mode='--sim' in sys.argv)
+        import math
+        from geopy.distance import geodesic
+        import json
+        import os
         
-        # Initialize motors but don't use them
-        from hardware.motor_controller import MotorController
-        motors = MotorController()
-        motors.set_speed(0)  # Ensure motors are stopped
+        # Fix file path resolution
+        if not os.path.exists(waypoints_file):
+            # Try alternate locations
+            possible_paths = [
+                waypoints_file,
+                os.path.join('data', waypoints_file),
+                os.path.join('..', 'data', waypoints_file),
+                os.path.join('..', '..', 'data', waypoints_file),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', waypoints_file),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', waypoints_file)
+            ]
+            
+            for path in possible_paths:
+                if os.path.exists(path):
+                    waypoints_file = path
+                    logger.info(f"Found waypoints file at: {path}")
+                    break
+                    
+        if not os.path.exists(waypoints_file):
+            logger.error(f"Could not find waypoints file: {waypoints_file}")
+            return
         
-        logger.info("Hardware initialized for testing")
+        # Load waypoints exactly as the map visualizer does
+        logger.info(f"Loading waypoints from {waypoints_file}")
+        with open(waypoints_file, 'r') as f:
+            waypoint_data = json.load(f)
         
-        # Wait for valid GPS position
-        logger.info("Waiting for valid GPS position...")
-        while True:
-            lat, lon, heading, speed = gps.get_position_and_heading()
-            if lat is not None and lon is not None:
-                logger.info(f"Valid GPS position obtained: {lat}, {lon}, heading: {heading}°")
-                break
-            time.sleep(0.5)
+        # Handle different JSON formats
+        if isinstance(waypoint_data, list):
+            # Direct array format
+            if isinstance(waypoint_data[0], list):
+                all_waypoints = waypoint_data
+            # Object format with lat/lon
+            elif isinstance(waypoint_data[0], dict) and 'lat' in waypoint_data[0]:
+                all_waypoints = [[point['lat'], point['lon']] for point in waypoint_data]
+            else:
+                logger.error("Unknown waypoint format")
+                return
+        else:
+            logger.error("Waypoint file doesn't contain an array")
+            return
         
-        # Set up for heading calculations
-        current_waypoint = 0
+        # Ensure numpy array for consistent operation
+        all_waypoints = np.array(all_waypoints)
         
-        # Main test loop
-        logger.info("Starting GPS monitoring. Press Ctrl+C to exit...")
+        # Log loaded waypoints
+        logger.info(f"Loaded {len(all_waypoints)} waypoints:")
+        for i, wp in enumerate(all_waypoints):
+            logger.info(f"WP {i}: ({wp[0]:.7f}, {wp[1]:.7f})")
         
-        # For calculating distance moved
-        initial_lat, initial_lon = lat, lon
-        last_lat, last_lon = lat, lon
-        total_distance = 0
-        last_update_time = time.time()
-        update_interval = 0.1  # 10Hz updates
+        # Initialize GPS
+        gps = GPSMonitor()
         
-        # For calculating heading from movement
-        positions = []
-        movement_bearing = None
+        # Constants
+        update_interval = 1.0  # Update every 1 second
+        last_update_time = 0
+        
+        # Calculate bearing EXACTLY as map_visualizer.py does
+        def calculate_bearing(lat1, lon1, lat2, lon2):
+            """Calculate bearing between two points exactly as in map_visualizer"""
+            lat1_rad = math.radians(lat1)
+            lon1_rad = math.radians(lon1)
+            lat2_rad = math.radians(lat2)
+            lon2_rad = math.radians(lon2)
+            
+            dlon = lon2_rad - lon1_rad
+            y = math.sin(dlon) * math.cos(lat2_rad)
+            x = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon)
+            bearing = math.atan2(y, x)  # Note: atan2(y,x) NOT atan2(x,y)
+            
+            bearing_deg = math.degrees(bearing)
+            bearing_deg = (bearing_deg + 360) % 360
+            return bearing_deg
+        
+        logger.info("Starting GPS test. Press Ctrl+C to exit.")
         
         while True:
             current_time = time.time()
             
-            # Update at fixed interval
+            # Check if it's time to update
             if current_time - last_update_time >= update_interval:
                 last_update_time = current_time
                 
@@ -405,109 +608,44 @@ def run_gps_test(waypoints_file, config=None):
                     logger.warning("GPS position unavailable")
                     continue
                 
-                # Store position for movement tracking (max 10 recent positions)
-                positions.append((lat, lon, current_time))
-                if len(positions) > 10:
-                    positions.pop(0)
+                # Format output exactly like map_visualizer.py
+                logger.info("\n=== WAYPOINT INFORMATION ===")
+                logger.info(f"{'WP':<4}{'Distance (m)':<14}{'Bearing':<10}{'Turn'}")
+                logger.info("-" * 40)
                 
-                # Calculate distance from start
-                from_start = geodesic((initial_lat, initial_lon), (lat, lon)).meters
-                
-                # Calculate distance from last point
-                from_last = geodesic((last_lat, last_lon), (lat, lon)).meters
-                total_distance += from_last
-                
-                # Update last position
-                last_lat, last_lon = lat, lon
-                
-                # Calculate heading to each waypoint
-                waypoint_info = []
-                for i, wp in enumerate(waypoints):
-                    # Calculate bearing to this waypoint
-                    bear = calculate_bearing(lat, lon, wp[0], wp[1])
+                for i, wp in enumerate(all_waypoints):
+                    wp_lat, wp_lon = wp
+                    dist = geodesic((lat, lon), (wp_lat, wp_lon)).meters
+                    bearing = calculate_bearing(lat, lon, wp_lat, wp_lon)
                     
-                    # Calculate distance to this waypoint
-                    dist = geodesic((lat, lon), (wp[0], wp[1])).meters
+                    # Calculate turn direction if heading is available
+                    turn_info = ""
+                    if heading is not None:
+                        relative_bearing = bearing - heading
+                        relative_bearing = ((relative_bearing + 180) % 360) - 180  # Normalize to -180 to 180
+                        
+                        if abs(relative_bearing) < 1:
+                            turn_direction = "↑"
+                        elif relative_bearing > 0:
+                            turn_direction = "→"
+                        else:
+                            turn_direction = "←"
+                            
+                        turn_info = f"{turn_direction} {abs(relative_bearing):.1f}°"
                     
-                    # Calculate what heading error would be for this waypoint
-                    heading_diff = ((bear - heading + 180) % 360) - 180
-                    
-                    waypoint_info.append({
-                        'index': i,
-                        'bearing': bear,
-                        'distance': dist,
-                        'heading_error': heading_diff
-                    })
+                    logger.info(f"{i:<4}{dist:<14.1f}{bearing:<10.1f}°{turn_info}")
                 
-                # Calculate heading from movement if we've moved enough
-                if len(positions) >= 2:
-                    # Use last 2 positions that are at least 10cm apart
-                    pos_idx = -1
-                    for i in range(len(positions) - 2, -1, -1):
-                        dist = geodesic(
-                            (positions[i][0], positions[i][1]), 
-                            (positions[-1][0], positions[-1][1])
-                        ).meters
-                        if dist > 0.1:  # 10cm threshold
-                            pos_idx = i
-                            break
-                    
-                    if pos_idx >= 0:
-                        old_lat, old_lon, _ = positions[pos_idx]
-                        movement_bearing = calculate_bearing(old_lat, old_lon, lat, lon)
-                
-                # Print GPS information
-                logger.info(f"\n===== GPS DIAGNOSTICS =====")
-                logger.info(f"Position: {lat:.8f}, {lon:.8f}")
-                logger.info(f"GPS Heading: {heading:.1f}° | Speed: {speed:.2f} m/s")
-                if movement_bearing is not None:
-                    logger.info(f"Movement Heading: {movement_bearing:.1f}° | "
-                               f"Diff from GPS: {((movement_bearing - heading + 180) % 360 - 180):.1f}°")
-                logger.info(f"Distance - From start: {from_start:.2f}m | Total: {total_distance:.2f}m")
-                
-                # Print waypoint information
-                logger.info(f"\n===== WAYPOINT INFO =====")
-                if current_waypoint < len(waypoints):
-                    wp = waypoint_info[current_waypoint]
-                    logger.info(f"Current target - WP {wp['index']}: "
-                               f"Bearing: {wp['bearing']:.1f}°, "
-                               f"Distance: {wp['distance']:.2f}m, "
-                               f"Heading Error: {wp['heading_error']:.1f}°")
-                    
-                    logger.info(f"To steer correctly: "
-                               f"{'RIGHT' if wp['heading_error'] > 0 else 'LEFT'} "
-                               f"by {abs(wp['heading_error']):.1f}°")
-                
-                # Print nearest waypoint
-                nearest_wp = min(waypoint_info, key=lambda w: w['distance'])
-                logger.info(f"Nearest waypoint: WP {nearest_wp['index']} - {nearest_wp['distance']:.2f}m away")
-                
-                # Print all waypoints in compact form
-                logger.info("\nAll Waypoints:")
-                for wp in waypoint_info:
-                    logger.info(f"WP {wp['index']}: {wp['distance']:.1f}m at {wp['bearing']:.1f}° "
-                               f"(error: {wp['heading_error']:+.1f}°)")
-                
-                # Divider for readability
-                logger.info("\n" + "=" * 30)
+                logger.info("=" * 40)
             
             # Small delay to prevent CPU hogging
-            time.sleep(0.01)
+            time.sleep(0.1)
             
     except KeyboardInterrupt:
-        logger.info("GPS test mode stopped by user")
+        logger.info("GPS test stopped by user")
     except Exception as e:
-        logger.error(f"Error in GPS test mode: {e}")
+        logger.error(f"Error in GPS test: {e}")
         import traceback
         logger.error(traceback.format_exc())
-    finally:
-        # Clean up
-        if 'gps' in locals():
-            gps.stop()
-        if 'motors' in locals():
-            motors.set_speed(0)  # Ensure motors are stopped
-        logger.info("GPS test mode terminated")
-
 
 # Add helper function for bearing calculation
 def calculate_bearing(lat1, lon1, lat2, lon2):
@@ -534,6 +672,7 @@ def main():
                         help='JSON file containing waypoints')
     parser.add_argument('--config', type=str, help='JSON file containing configuration')
     parser.add_argument('--animate', action='store_true', help='Create animation in simulation mode')
+    parser.add_argument('--replay', action='store_true', help='Replay simulation with progress logging')
     
     args = parser.parse_args()
     

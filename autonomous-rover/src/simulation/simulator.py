@@ -18,11 +18,56 @@ def normalize_angle(angle):
         angle += 2.0 * np.pi
     return angle
 
-def simulate(waypoints, x0, y0, yaw0, v0, target_idx=1, k=4.8, k_e=10.0, 
-             target_speed=2.0, dt=0.1, L=1.0, max_steer=np.radians(50), 
-             max_simulation_steps=1000, waypoint_reach_threshold=1.0,
-             METERS_PER_LAT_DEGREE=111000):
-    """Simulate rover movement with Stanley controller"""
+def simplified_stanley_control(x, y, yaw, waypoints, target_idx, max_steer, steering_sensitivity, waypoint_reach_threshold, METERS_PER_LAT_DEGREE):
+    """
+    Simplified Stanley control using tanh function for steering.
+    """
+    # Find nearest waypoint
+    dist_to_waypoints = np.sum((waypoints[:, :2] - [x, y]) ** 2, axis=1)
+    curr_nearest_point_idx = np.argmin(dist_to_waypoints)
+    
+    # Check if we've reached the target waypoint
+    if target_idx < len(waypoints) - 1:
+        tx, ty = waypoints[target_idx]
+        dist_to_target = np.sqrt((tx - x) ** 2 + (ty - y) ** 2)
+        
+        if dist_to_target < waypoint_reach_threshold:
+            target_idx += 1
+    
+    # Current target waypoint
+    tx = waypoints[target_idx, 0]
+    ty = waypoints[target_idx, 1]
+    
+    # Calculate distance to current target
+    dist_to_target = np.sqrt((tx - x) ** 2 + (ty - y) ** 2)
+    
+    # Calculate bearing to target
+    target_bearing = np.arctan2(ty - y, tx - x)
+    
+    # Calculate heading error
+    heading_error = target_bearing - yaw
+    
+    # Normalize to [-pi, pi]
+    while heading_error > np.pi:
+        heading_error -= 2 * np.pi
+    while heading_error < -np.pi:
+        heading_error += 2 * np.pi
+    
+    # Calculate cross-track error for reporting only
+    cte = 0.0  # Simplified: we don't use this for steering
+    
+    # SIMPLIFIED STEERING WITH TANH
+    steering_angle = np.tanh(heading_error / steering_sensitivity)
+    delta = steering_angle * max_steer
+    
+    return delta, target_idx, cte, heading_error, dist_to_target
+
+def simulate(waypoints, x0, y0, yaw0, v0, target_idx=1, target_speed=1.0, 
+             dt=0.1, max_steer=np.radians(45), steering_sensitivity=np.pi/3,
+             waypoint_reach_threshold=1.0, METERS_PER_LAT_DEGREE=111000):
+    """
+    Simulate vehicle motion with the simplified tanh-based controller.
+    """
     # State variables
     x = x0
     y = y0
@@ -40,57 +85,13 @@ def simulate(waypoints, x0, y0, yaw0, v0, target_idx=1, k=4.8, k_e=10.0,
     ctes = [0.0]
     
     # Simulation loop
-    for i in range(max_simulation_steps):
+    for i in range(1000):
         # Calculate meters per lon degree based on current latitude
         meters_per_lon_degree = METERS_PER_LAT_DEGREE * np.cos(np.radians(x))
         
-        # Target waypoint
-        current_waypoint = waypoints[max(0, target_idx-1)]
-        target_waypoint = waypoints[target_idx]
-        
-        # Calculate heading error - angle to the target
-        dx = target_waypoint[0] - x
-        dy = target_waypoint[1] - y
-        desired_course_angle = np.arctan2(dy * meters_per_lon_degree, dx * METERS_PER_LAT_DEGREE)
-        heading_error = normalize_angle(desired_course_angle - yaw)
-        
-        # Calculate cross-track error
-        # Vector from previous waypoint to current position
-        vx = (x - current_waypoint[0]) * METERS_PER_LAT_DEGREE
-        vy = (y - current_waypoint[1]) * meters_per_lon_degree
-        
-        # Vector representing the path
-        wx = (target_waypoint[0] - current_waypoint[0]) * METERS_PER_LAT_DEGREE
-        wy = (target_waypoint[1] - current_waypoint[1]) * meters_per_lon_degree
-        
-        # Path length
-        path_length_squared = wx * wx + wy * wy
-        
-        # Calculate cross-track error
-        if path_length_squared < 1e-6:
-            cte = haversine_distance((x, y), current_waypoint)
-        else:
-            # Calculate projection
-            proj = (wx * vx + wy * vy) / path_length_squared
-            proj = max(0.0, min(1.0, proj))  # Clamp to [0, 1]
-            
-            # Calculate closest point on the path
-            cx = current_waypoint[0] + proj * (target_waypoint[0] - current_waypoint[0])
-            cy = current_waypoint[1] + proj * (target_waypoint[1] - current_waypoint[1])
-            
-            # Cross-track error in meters
-            cte = haversine_distance((x, y), (cx, cy))
-            
-            # Determine sign of cross-track error
-            cross_product = wx * vy - wy * vx
-            if cross_product > 0:
-                cte = -cte  # Left of path
-        
-        # Stanley control law
-        delta_heading = k * heading_error
-        delta_cte = np.arctan2(k_e * cte, v + 0.1)  # Adding small value to avoid division by zero
-        delta = delta_heading + delta_cte
-        delta = np.clip(delta, -max_steer, max_steer)
+        # Simplified Stanley control
+        delta, target_idx, cte, heading_error, dist_to_target = simplified_stanley_control(
+            x, y, yaw, waypoints, target_idx, max_steer, steering_sensitivity, waypoint_reach_threshold, METERS_PER_LAT_DEGREE)
         
         # Update velocity
         v += 0.5 * (target_speed - v) * dt  # Simple P controller
@@ -99,15 +100,8 @@ def simulate(waypoints, x0, y0, yaw0, v0, target_idx=1, k=4.8, k_e=10.0,
         # Update position using bicycle model
         x += v * np.cos(yaw) * dt / METERS_PER_LAT_DEGREE
         y += v * np.sin(yaw) * dt / meters_per_lon_degree
-        yaw += v * np.tan(delta) * dt / L
+        yaw += v * np.tan(delta) * dt / 1.0
         yaw = normalize_angle(yaw)
-        
-        # Check if reached target waypoint
-        distance_to_target = haversine_distance((x, y), (target_waypoint[0], target_waypoint[1]))
-        
-        if distance_to_target < waypoint_reach_threshold and target_idx < len(waypoints) - 1:
-            target_idx += 1
-            logger.info(f"Reached waypoint {target_idx-1}")
         
         # Store results
         times.append(times[-1] + dt)
@@ -120,7 +114,7 @@ def simulate(waypoints, x0, y0, yaw0, v0, target_idx=1, k=4.8, k_e=10.0,
         ctes.append(cte)
         
         # Stop if we've reached the final waypoint
-        if target_idx == len(waypoints) - 1 and distance_to_target < waypoint_reach_threshold:
+        if target_idx == len(waypoints) - 1 and dist_to_target < waypoint_reach_threshold:
             logger.info("Reached final waypoint")
             break
     

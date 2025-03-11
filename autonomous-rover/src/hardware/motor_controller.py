@@ -1,7 +1,7 @@
 from adafruit_servokit import ServoKit
-import time
+import numpy as np
 import logging
-import os  # Add this for the os.path.basename function
+import os  # For the os.path.basename function
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -11,10 +11,15 @@ logger = logging.getLogger(__name__)
 _motor_controller_instance = None
 
 class MotorController:
-    def __init__(self, max_speed=0.2, turn_factor=0.9):
-        """Initialize the motor controller with configuration parameters."""
+    def __init__(self, max_speed=0.3, turn_factor=0.7):
+        """Initialize the motor controller with configuration parameters.
+        
+        Args:
+            max_speed: Maximum speed value (0.0 to 1.0)
+            turn_factor: How much to reduce inside wheel speed when turning (0.0 to 1.0)
+        """
         self.max_speed = max_speed
-        self.turn_factor = turn_factor
+        self.turn_factor = turn_factor  # How much to slow the inside wheel during turns
         self.left_speed = 0.0
         self.right_speed = 0.0
         self.current_steering = 0.0
@@ -31,173 +36,136 @@ class MotorController:
             logger.info("Motor controller initialized successfully")
             return True
         except Exception as e:
-            logger.error(f"Failed to initialize motors: {e}")
+            logger.error(f"Failed to initialize motor controller: {e}")
             return False
     
     def set_speed(self, speed):
-        """Set the speed of the rover's motors while preserving steering."""
-        # Debug where this is being called from
-        import traceback
-        caller = traceback.extract_stack()[-2]
-        logger.info(f"set_speed({speed:.2f}) called from {os.path.basename(caller.filename)}:{caller.lineno}")
+        """Set the speed of the rover's motors while preserving steering.
         
-        # Ensure speed is within bounds
-        speed = max(-self.max_speed, min(self.max_speed, speed))
+        Args:
+            speed: Speed value from -max_speed to max_speed
+                  Negative values mean reverse.
+        """
+        # Bound speed to max_speed
+        speed = np.clip(speed, -self.max_speed, self.max_speed)
+        logger.debug(f"Setting speed: {speed}")
         
-        # Check if we have active steering
-        if hasattr(self, 'current_steering') and abs(self.current_steering) > 0.1:
-            logger.info(f"Preserving steering differential for angle {self.current_steering:.1f}°")
-            
-            # Calculate steering factor again
-            steering_factor = max(-1, min(1, self.current_steering / 35.0))
-            
-            # Apply differential steering based on the new target speed
-            if steering_factor < 0:  # Turn left
-                self.left_speed = speed * (1 - self.turn_factor * abs(steering_factor))
-                self.right_speed = speed
-            elif steering_factor > 0:  # Turn right
-                self.left_speed = speed
-                self.right_speed = speed * (1 - self.turn_factor * abs(steering_factor))
-            else:
-                self.left_speed = speed
-                self.right_speed = speed
-                
-            logger.info(f"After speed adjust w/steering: L={self.left_speed:.2f}, R={self.right_speed:.2f}")
-        else:
-            # No steering, set both motors equal
-            self.left_speed = speed
-            self.right_speed = speed
-        
-        # Apply the speed to motors
-        self._apply_motor_speeds()
-        
+        # Apply current steering with the new speed
+        self._apply_steering_and_speed(self.current_steering, speed)
         return True
     
-    def set_steering(self, direction_degrees):
+    def set_steering(self, angle_degrees):
         """
-        Set the steering direction in degrees.
-        Negative = LEFT turn, Positive = RIGHT turn, 0 = straight
+        Set steering angle in degrees (-90 to +90)
+        Positive angle turns right, negative angle turns left
         """
-        # Store current steering angle
-        self.current_steering = direction_degrees
+        # Clamp angle to valid range
+        angle_degrees = max(-90, min(90, angle_degrees))
         
-        # Get current base speed
-        base_speed = self.max_speed
+        # Debug the input
+        logger.warning(f"MOTOR DEBUG - Raw steering command: {angle_degrees:.1f}°")
         
-        # SIMPLIFIED APPROACH: Use direct logic with clear comments
-        if direction_degrees < 0:  # NEGATIVE = LEFT TURN
-            # For LEFT turn: LEFT motor slower, RIGHT motor faster
-            left_speed = max(0, base_speed * 0.1)  # Very slow left motor
-            right_speed = base_speed  # Full speed right motor
-            logger.info(f"LEFT TURN: {direction_degrees:.1f}°")
-        elif direction_degrees > 0:  # POSITIVE = RIGHT TURN
-            # For RIGHT turn: RIGHT motor slower, LEFT motor faster
-            left_speed = base_speed  # Full speed left motor
-            right_speed = max(0, base_speed * 0.1)  # Very slow right motor
-            logger.info(f"RIGHT TURN: {direction_degrees:.1f}°")
-        else:  # Go straight
-            left_speed = base_speed
-            right_speed = base_speed
-            logger.info("STRAIGHT")
+        # Determine turn direction for logging
+        if abs(angle_degrees) < 2:
+            direction = "STRAIGHT"
+        elif angle_degrees > 0:
+            direction = "RIGHT TURN"
+        else:
+            direction = "LEFT TURN"
         
-        # Store the calculated speeds
+        logger.info(f"{direction}: {abs(angle_degrees):.1f}°")
+        
+        # Calculate differential steering - add detailed logging
+        if angle_degrees > 0:  # Turn right
+            left_factor = 1.0  # Left wheel at full speed
+            right_factor = 1.0 - 2 * (angle_degrees / 180.0)  # Right wheel slows down
+            logger.warning(f"MOTOR DEBUG - RIGHT turn factors: L={left_factor:.3f}, R={right_factor:.3f}")
+        else:  # Turn left
+            right_factor = 1.0  # Right wheel at full speed
+            left_factor = 1.0 + 2 * (angle_degrees / 180.0)  # Left wheel slows down
+            logger.warning(f"MOTOR DEBUG - LEFT turn factors: L={left_factor:.3f}, R={right_factor:.3f}")
+        
+        # Store for later use with set_speed
+        self._left_factor = max(0, min(1, left_factor))
+        self._right_factor = max(0, min(1, right_factor))
+    
+    def _apply_steering_and_speed(self, steering_degrees, speed):
+        """Apply steering and speed settings to motors.
+        
+        Args:
+            steering_degrees: Steering angle in degrees
+            speed: Target speed value (positive or negative)
+        """
+        # Store the current steering angle and speed
+        self.current_steering = steering_degrees
+        
+        # Bound speed to max_speed
+        speed = np.clip(speed, -self.max_speed, self.max_speed)
+        
+        # FIXED: Use the precalculated factors from set_steering
+        # These factors already account for steering - no need to recalculate
+        left_speed = speed * self._left_factor
+        right_speed = speed * self._right_factor
+        
+        # Debug the actual application
+        logger.warning(f"MOTOR DEBUG - Speed={speed:.2f}, Factors: L={self._left_factor:.2f}, R={self._right_factor:.2f}")
+        logger.warning(f"MOTOR DEBUG - Final speeds: L={left_speed:.2f}, R={right_speed:.2f}")
+        
+        # Update the stored speed values
         self.left_speed = left_speed
         self.right_speed = right_speed
         
-        # Apply the speeds to motors
-        self._apply_motor_speeds()
+        logger.info(f"Applying to motors - Left: {self.left_speed:.2f}, Right: {self.right_speed:.2f}")
         
-        return True
-    
-    def _apply_motor_speeds(self):
-        """Apply the calculated speeds to the actual motors."""
+        # Set the motors
         try:
-            if self.servo_kit:
-                # Debug the values we're trying to send
-                logger.info(f"Applying to motors - Left: {self.left_speed:.2f}, Right: {self.right_speed:.2f}")
-                
-                # Ensure values are within appropriate ranges (-1.0 to 1.0)
-                left = max(-1.0, min(1.0, self.left_speed))
-                right = max(-1.0, min(1.0, self.right_speed))
-                
-                # Apply to servo channels
-                self.servo_kit.continuous_servo[1].throttle = left
-                self.servo_kit.continuous_servo[0].throttle = right
-                
-                # Verify the values were set correctly
-                time.sleep(0.01)  # Small delay to allow values to be set
-                logger.info(f"Motor values set - Left: {self.servo_kit.continuous_servo[1].throttle}, "
-                           f"Right: {self.servo_kit.continuous_servo[0].throttle}")
-                
-                return True
-            else:
-                logger.error("Servo kit not initialized")
-                return False
+            self.servo_kit.continuous_servo[1].throttle = self.left_speed
+            self.servo_kit.continuous_servo[0].throttle = self.right_speed
+            logger.debug(f"Motor values set - Left: {self.left_speed}, Right: {self.right_speed}")
+            return True
         except Exception as e:
             logger.error(f"Error setting motor speeds: {e}")
             return False
     
     def stop(self):
-        """Stop the rover's motors."""
+        """Stop all motors."""
         try:
-            self.left_speed = 0
-            self.right_speed = 0
-            if self.servo_kit:
-                self.servo_kit.continuous_servo[0].throttle = 0
-                self.servo_kit.continuous_servo[1].throttle = 0
+            self.servo_kit.continuous_servo[0].throttle = 0
+            self.servo_kit.continuous_servo[1].throttle = 0
+            self.left_speed = 0.0
+            self.right_speed = 0.0
             logger.info("Motors stopped")
             return True
         except Exception as e:
             logger.error(f"Error stopping motors: {e}")
             return False
-
+    
+    def set_heading_error(self, error_degrees):
+        """Store current heading error for logging/debugging."""
+        self.heading_error = error_degrees
+    
     def get_status(self):
-        """Get current motor status."""
+        """Get current motor controller status."""
         return {
             'left_speed': self.left_speed,
             'right_speed': self.right_speed,
-            'steering': self.current_steering,
+            'current_steering': self.current_steering,
             'heading_error': self.heading_error
         }
 
-    def set_heading_error(self, error_degrees):
-        """Store the current heading error for logging purposes."""
-        self.heading_error = error_degrees
-
-# Singleton getter function
-def get_motor_controller():
-    """Get or create the singleton motor controller instance."""
+def get_motor_controller(max_speed=0.3, turn_factor=0.7):  # Change from 0.2 to 0.3
+    """Get a singleton instance of the motor controller."""
     global _motor_controller_instance
     if _motor_controller_instance is None:
-        _motor_controller_instance = MotorController()
+        _motor_controller_instance = MotorController(max_speed=max_speed, turn_factor=turn_factor)
     return _motor_controller_instance
 
-# Backward compatibility functions that use the singleton instance
-def set_motor_speed(speed):
-    """Legacy function for setting motor speed."""
-    controller = get_motor_controller()
-    return controller.set_speed(speed)
+# Legacy compatibility functions
+def set_speed(speed):
+    return get_motor_controller().set_speed(speed)
 
-def set_motor_direction(direction):
-    """Legacy function for setting motor direction."""
-    controller = get_motor_controller()
-    return controller.set_steering(direction)
+def set_steering(direction_degrees):
+    return get_motor_controller().set_steering(direction_degrees)
 
-def stop_motors():
-    """Legacy function for stopping motors."""
-    controller = get_motor_controller()
-    return controller.stop()
-
-def initialize_motors():
-    """Legacy function for initializing motors."""
-    controller = get_motor_controller()
-    return controller.initialize()
-
-def update_motor_controls(speed, direction):
-    """Legacy function for updating motor controls."""
-    controller = get_motor_controller()
-    # IMPORTANT: Set steering first, THEN speed
-    # This way speed won't override the steering settings
-    controller.set_steering(direction)
-    # Don't set speed again, as it would override steering
-    return True
+def stop():
+    return get_motor_controller().stop()
