@@ -81,11 +81,11 @@ def setup_logging():
 # Call this at the beginning of your main function
 logger, data_logger = setup_logging()
 
+# Add this to your load_waypoints function
 def load_waypoints(waypoints_file):
-    """Load waypoints from file with better validation."""
+    """Load waypoints from a file"""
     try:
-        logger.info(f"Loading waypoints from: {waypoints_file}")
-        waypoints = []
+        logger.info(f"Loading waypoints from {waypoints_file}")
         
         # Determine file type and load accordingly
         if waypoints_file.endswith('.json'):
@@ -97,8 +97,13 @@ def load_waypoints(waypoints_file):
                         waypoints = np.array(data, dtype=np.float64)
                     elif isinstance(data[0], dict) and 'lat' in data[0] and 'lon' in data[0]:
                         waypoints = np.array([[point['lat'], point['lon']] for point in data], dtype=np.float64)
+                elif 'waypoints' in data:
+                    waypoints = np.array(data['waypoints'], dtype=np.float64)
+                else:
+                    waypoints = np.array([])
         else:
             # Assume it's a CSV or similar text format
+            waypoints_list = []
             with open(waypoints_file, 'r') as f:
                 for line in f:
                     parts = line.strip().split(',')
@@ -106,28 +111,28 @@ def load_waypoints(waypoints_file):
                         try:
                             lat = float(parts[0])
                             lon = float(parts[1])
-                            waypoints.append([lat, lon])
+                            waypoints_list.append([lat, lon])
                         except ValueError:
-                            logger.warning(f"Skipping invalid line: {line.strip()}")
-                            continue
-            waypoints = np.array(waypoints, dtype=np.float64)
-        
-        # Validate waypoints
-        if len(waypoints) < 2:
-            logger.error(f"Not enough valid waypoints found (need at least 2, found {len(waypoints)})")
-            return np.array([[0, 0], [0.0001, 0.0001]])  # Provide dummy waypoints
-        
-        # Log all waypoints after loading (IMPORTANT)
-        logger.info(f"Successfully loaded {len(waypoints)} waypoints:")
-        for i, wp in enumerate(waypoints):
-            logger.info(f"WP {i}: ({wp[0]:.7f}, {wp[1]:.7f})")
+                            logger.warning(f"Skipping invalid line: {line}")
             
-        return waypoints
+            waypoints = np.array(waypoints_list, dtype=np.float64)
         
+        # Validate waypoints - use len() check instead of direct truth value evaluation
+        if len(waypoints) == 0:
+            logger.error("No valid waypoints found in file")
+        else:
+            logger.info(f"Loaded {len(waypoints)} waypoints")
+            
+            # Debug output to check waypoints
+            for i, wp in enumerate(waypoints):
+                logger.info(f"Waypoint {i}: ({wp[0]:.7f}, {wp[1]:.7f})")
+        
+        return waypoints
+    
     except Exception as e:
         logger.error(f"Error loading waypoints: {e}")
-        # Return dummy waypoints if loading fails
-        return np.array([[0, 0], [0.0001, 0.0001]])
+        logger.error(traceback.format_exc())
+        return np.array([])  # Return empty array on error
 
 def run_simulation(waypoints_file, config=None):
     """Run the rover in simulation mode"""
@@ -140,7 +145,7 @@ def run_simulation(waypoints_file, config=None):
         config = {
             'dt': 0.1,                      # Time step (seconds)
             'max_steer': np.radians(90),    # Maximum steering angle
-            'target_speed': 2.0,            # Target speed (m/s)
+            'target_speed': 3.25,            # Target speed (m/s)
             'extension_distance': 1.0,      # Extension distance beyond final waypoint
             'waypoint_reach_threshold': 1.0, # Distance threshold to consider waypoint reached
             'steering_sensitivity': np.pi/36  # Denominator for tanh function (lower = more aggressive)
@@ -318,7 +323,7 @@ def run_hardware(waypoints_file, config=None):
         config = {
             'max_steer': np.radians(90),   # Maximum steering angle
             'speed': 0.30,                 # Target speed (m/s)
-            'update_rate': 10,             # Control loop update rate (Hz)
+            'update_rate': 5,             # Control loop update rate (Hz)
             'extension_distance': 1.0,     # Extension distance beyond final waypoint
             'waypoint_reach_threshold': 1.0,  # Distance threshold to consider waypoint reached
             'steering_sensitivity': np.pi/3   # Denominator for tanh function
@@ -350,24 +355,83 @@ def run_hardware(waypoints_file, config=None):
         )
         
         # ======== GPS PREFLIGHT CHECK ========
-        # Same patient approach as gps-test mode
         logger.info("Performing GPS preflight check...")
         gps_ready = False
-        max_wait_time = 10  # seconds
+        max_wait_time = 30  # seconds
         start_time = time.time()
         
-        while not gps_ready and time.time() - start_time < max_wait_time:
-            lat, lon, heading, speed = gps.get_position_and_heading()
+        # First check - see if we already have valid GPS data
+        lat, lon, heading, speed = gps.get_position_and_heading()
+        front_ok = lat is not None and lon is not None
+        rear_ok = gps.gps_data["rear"]["lat"] is not None and gps.gps_data["rear"]["lon"] is not None
+        heading_ok = heading is not None
+        
+        if front_ok and rear_ok and heading_ok:
+            logger.info("GPS data already valid! Preflight check passed immediately.")
+            gps_ready = True
+        else:
+            logger.info("Waiting for valid GPS data from both units...")
             
-            if lat is not None and lon is not None and heading is not None:
-                logger.info(f"GPS data valid: ({lat:.7f}, {lon:.7f}), heading: {heading:.1f}°")
-                gps_ready = True
-            else:
-                logger.warning("GPS position unavailable, waiting...")
+            # Status indicators for progress monitoring
+            front_seen = front_ok
+            rear_seen = rear_ok
+            heading_seen = heading_ok
+            
+            while not gps_ready and time.time() - start_time < max_wait_time:
+                # Get latest data
+                lat, lon, heading, speed = gps.get_position_and_heading()
+                front_ok = lat is not None and lon is not None
+                rear_ok = gps.gps_data["rear"]["lat"] is not None and gps.gps_data["rear"]["lon"] is not None
+                heading_ok = heading is not None
+                
+                # Update status indicators and log first appearance
+                if front_ok and not front_seen:
+                    logger.info("✅ Front GPS position acquired!")
+                    front_seen = True
+                    
+                if rear_ok and not rear_seen:
+                    logger.info("✅ Rear GPS position acquired!")
+                    rear_seen = True
+                    
+                if heading_ok and not heading_seen:
+                    logger.info("✅ Valid heading calculated!")
+                    heading_seen = True
+                
+                # Check if we have everything we need
+                if front_ok and rear_ok and heading_ok:
+                    logger.info("All GPS checks passed!")
+                    gps_ready = True
+                    break
+                
+                # Report what we're still waiting for
+                missing = []
+                if not front_ok:
+                    missing.append("Front GPS position")
+                if not rear_ok:
+                    missing.append("Rear GPS position")
+                if not heading_ok:
+                    missing.append("valid heading")
+                
+                # Only log every second to avoid spamming
+                logger.info(f"Still waiting for: {', '.join(missing)}")
                 time.sleep(1)
         
-        if not gps_ready:
-            logger.error("GPS data not available after waiting. Check GPS installation.")
+        if gps_ready:
+            # Log success with details
+            logger.info(f"GPS PREFLIGHT CHECK PASSED!")
+            logger.info(f"Front GPS: ({lat:.7f}, {lon:.7f})")
+            logger.info(f"Rear GPS: ({gps.gps_data['rear']['lat']:.7f}, {gps.gps_data['rear']['lon']:.7f})")
+            logger.info(f"Heading: {heading:.1f}°")
+            
+            # Calculate distance between GPS units
+            distance = gps.get_distance_between_gps()
+            if distance:
+                logger.info(f"GPS separation: {distance:.2f}m")
+        else:
+            logger.error("GPS PREFLIGHT CHECK FAILED! Check GPS connections and visibility.")
+            logger.error(f"Front GPS status: {'OK' if front_ok else 'MISSING'}")
+            logger.error(f"Rear GPS status: {'OK' if rear_ok else 'MISSING'}")
+            logger.error(f"Heading status: {'OK' if heading_ok else 'MISSING'}")
             return
         # ======================================
         
@@ -378,8 +442,25 @@ def run_hardware(waypoints_file, config=None):
         # Add flag to track mission completion
         mission_complete = False
         
+        gps_health_check_interval = 10  # seconds
+        last_health_check = 0
+        
+        # Add variables for screen clearing at regular intervals
+        screen_clear_interval = 1.0  # Clear screen once per second
+        last_screen_clear = 0  # Track when we last cleared the screen
+        
         while True:
             try:
+                # Get current time
+                now = time.time()
+                
+                # Clear screen at regular intervals instead of every iteration
+                
+                # Perform periodic health checks
+                if now - last_health_check > gps_health_check_interval:
+                    diagnose_gps_health(gps)
+                    last_health_check = now
+                
                 # Get current position and heading from GPS
                 lat, lon, heading, speed = gps.get_position_and_heading()
                 
@@ -404,6 +485,29 @@ def run_hardware(waypoints_file, config=None):
                     heading=heading
                 )
                 
+                # Force a full GPS update to get fresh heading
+                # Check if the method exists before calling it
+                if hasattr(gps, '_recalculate_heading'):
+                    gps._recalculate_heading()
+                else:
+                    # Fallback in case the method doesn't exist
+                    logger.warning("_recalculate_heading method not found, using direct calculation")
+                    front_lat = gps.gps_data["front"]["lat"]
+                    front_lon = gps.gps_data["front"]["lon"]
+                    rear_lat = gps.gps_data["rear"]["lat"]
+                    rear_lon = gps.gps_data["rear"]["lon"]
+                    
+                    if None not in [front_lat, front_lon, rear_lat, rear_lon]:
+                        heading = gps.calculate_bearing(rear_lat, rear_lon, front_lat, front_lon)
+                        logger.info(f"Calculated fresh heading: {heading:.1f}°")
+                
+                fresh_lat, fresh_lon, fresh_heading, fresh_speed = gps.get_position_and_heading()
+                
+                if fresh_heading is not None:
+                    heading = fresh_heading
+                if fresh_lat is not None and fresh_lon is not None:
+                    lat, lon = fresh_lat, fresh_lon
+
                 # Check if we've reached the final waypoint
                 if target_idx >= len(waypoints) - 1 and distance < config['waypoint_reach_threshold']:
                     logger.info(f"🎯 FINAL WAYPOINT REACHED! Distance: {distance:.2f}m")
@@ -420,7 +524,58 @@ def run_hardware(waypoints_file, config=None):
                 # Set the motor speed
                 motors.set_speed(config["speed"])
                 
-                # Print debug information
+                # Print debug information with screen clear just before
+                current_time = time.time()
+                if current_time - last_screen_clear >= screen_clear_interval:
+                    # Clear screen
+                    #os.system('cls' if os.name == 'nt' else 'clear')
+                    last_screen_clear = current_time
+
+                    # FORCEFULLY recalculate heading to ensure it's fresh
+                    front_lat = gps.gps_data["front"]["lat"]
+                    front_lon = gps.gps_data["front"]["lon"]
+                    rear_lat = gps.gps_data["rear"]["lat"]
+                    rear_lon = gps.gps_data["rear"]["lon"]
+                    
+                    if None not in [front_lat, front_lon, rear_lat, rear_lon]:
+                        # Directly calculate heading without relying on stored values
+                        fresh_heading = gps.calculate_bearing(rear_lat, rear_lon, front_lat, front_lon)
+                        heading = fresh_heading  # Override the heading with our fresh calculation
+                        logger.debug(f"Force recalculated heading: {heading:.1f}°")
+                        
+                        # Update the heading in GPS data to ensure consistency
+                        gps.gps_data["front"]["heading"] = heading
+                        
+                        # Current timestamp for reference
+                        heading_calc_time = time.time()
+                        
+                        # Additional heading debugging
+                        logger.debug(f"Heading calc method: Direct calculation (rear→front bearing)")
+                    
+                    # Print header with timestamp for better readability
+                    print(f"===== ROVER NAVIGATION - {datetime.now().strftime('%H:%M:%S')} =====")
+                    print(f"Front GPS: {gps.gps_data['front']['satellites']} sats | Rear: {gps.gps_data['rear']['satellites']} sats")
+                    print(f"Waypoints: {len(waypoints)} | Target: {target_idx}/{len(waypoints)-1}")
+                    print("=" * 60)
+
+                    # Additional heading diagnostic information
+                    nmea_heading = gps.gps_data["front"].get("heading")
+                    calc_heading = None
+                    if None not in [front_lat, front_lon, rear_lat, rear_lon]:
+                        calc_heading = gps.calculate_bearing(rear_lat, rear_lon, front_lat, front_lon)
+                    
+                    print(f"LIVE HEADING: {heading:.1f}° (Direct calculation)")
+                    if nmea_heading is not None:
+                        print(f"NMEA Heading: {nmea_heading:.1f}°")
+                    if calc_heading is not None:
+                        print(f"GPS Separation: {gps.get_distance_between_gps():.2f}m")
+
+                    # Additional steering information
+                    expected_heading_change = steering_angle_deg * 0.1
+                    expected_heading = (heading + expected_heading_change + 360) % 360
+                    print(f"Steering: {steering_angle_deg:.1f}° | Target heading: {expected_heading:.1f}°")
+                    print("=" * 60)
+
                 logger.info(f"POS: ({lat:.7f}, {lon:.7f}) | HDG: {heading:.1f}° | " + 
                            f"TGT: {target_idx}/{len(waypoints)-1} | DIST: {distance:.1f}m | STEER: {steering_angle_deg:.1f}°")
                 
@@ -814,11 +969,6 @@ def verify_parameter_ordering(lat, lon, yaw, speed, waypoints, controller):
         swapped_bearing = controller._calculate_bearing(lon, lat, target_lat, target_lon)
         
         # 4. Swapped target coords
-        swapped_target_bearing = controller._calculate_bearing(lat, lon, target_lon, target_lat)
-        
-        # Log all for comparison
-        logger.critical("===== BEARING ALGORITHM CHECK =====")
-        logger.critical(f"Current: ({lat:.7f}, {lon:.7f}), Target: ({target_lat:.7f}, {target_lon:.7f})")
         logger.critical(f"Serial Monitor: {serial_bearing:.1f}°")
         logger.critical(f"Controller: {controller_bearing:.1f}°")
         logger.critical(f"Swapped Current: {swapped_bearing:.1f}°")
@@ -834,6 +984,53 @@ def verify_parameter_ordering(lat, lon, yaw, speed, waypoints, controller):
                 logger.critical("✅ SOLUTION: USE SWAPPED CURRENT COORDINATES")
             elif abs(serial_bearing - swapped_target_bearing) < 0.1:
                 logger.critical("✅ SOLUTION: USE SWAPPED TARGET COORDINATES")
+
+def diagnose_gps_health(gps):
+    """Check GPS health and report any issues"""
+    front = gps.gps_data["front"]
+    rear = gps.gps_data["rear"]
+    
+    front_ok = front["lat"] is not None and front["lon"] is not None
+    rear_ok = rear["lat"] is not None and rear["lon"] is not None
+    
+    issues = []
+    
+    if not front_ok:
+        issues.append("Front GPS not providing position data")
+    
+    if not rear_ok:
+        issues.append("Rear GPS not providing position data")
+    
+    # Check for stale data (more than 3 seconds old)
+    now = time.time()
+    if front_ok and now - front.get("last_update", 0) > 3.0:
+        issues.append(f"Front GPS data is stale ({now - front.get('last_update', 0):.1f}s old)")
+    
+    if rear_ok and - rear.get("last_update", 0) > 3.0:
+        issues.append(f"Rear GPS data is stale ({now - rear.get('last_update', 0):.1f}s old)")
+    
+    # Check fix quality
+    if front_ok and front["fix_quality"] < 2:
+        issues.append(f"Front GPS has poor fix quality ({front['fix_quality']})")
+    
+    if rear_ok and rear["fix_quality"] < 2:
+        issues.append(f"Rear GPS has poor fix quality ({rear['fix_quality']})")
+    
+    # Check satellite count
+    if front_ok and front["satellites"] < 5:
+        issues.append(f"Front GPS has few satellites ({front['satellites']})")
+    
+    if rear_ok and rear["satellites"] < 5:
+        issues.append(f"Rear GPS has few satellites ({rear['satellites']})")
+    
+    # Report issues if any
+    if issues:
+        logger.warning("GPS HEALTH ISSUES DETECTED:")
+        for issue in issues:
+            logger.warning(f"  - {issue}")
+        return False
+    
+    return True
 
 # Modify your main function to include the new GPS test mode
 def main():

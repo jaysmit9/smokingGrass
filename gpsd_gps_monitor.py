@@ -84,6 +84,12 @@ FIX_MODES = {
     'MANUAL': {'value': 12, 'desc': 'Manual', 'color': 'red'}
 }
 
+# Add at the top of your file, after other globals
+persistent_device_roles = {
+    "rover": None,
+    "base": None
+}
+
 class GpsdClient:
     """Client for GPSD service"""
     
@@ -94,145 +100,288 @@ class GpsdClient:
         self.debug = debug
         self.devices = {}  # Store info about each device
         self.last_data_time = datetime.now()
-        
+        self.buffer = ""  # Initialize JSON buffer
+    
     def log(self, message):
         if self.debug:
             print(f"[DEBUG] {message}")
             
     def connect(self):
-        """Connect to GPSD service"""
+        """Connect to GPSD service with improved initialization"""
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.connect((self.host, self.port))
+            print(f"✓ Connected to GPSD at {self.host}:{self.port}")
             
-            # First check devices
+            # Enhanced watch command with full features
+            watch_command = b'?WATCH={"enable":true,"json":true,"nmea":true,"raw":1,"scaled":true,"device":true};\n'
+            self.socket.send(watch_command)
+            self.log(f"Sent enhanced WATCH command")
+            
+            # Wait longer for initial response
+            time.sleep(0.5)
+            
+            # Force a POLL to get device info immediately
+            self.socket.send(b'?POLL;\n')
+            time.sleep(0.5)
+            
+            # Also ask for devices explicitly
             self.socket.send(b'?DEVICES;\n')
             time.sleep(0.5)
-            data = self.socket.recv(4096).decode('utf-8').strip()
-            self.log(f"DEVICES response: {data}")
             
-            # Enable watching with device field reporting
-            watch_command = b'?WATCH={"enable":true,"json":true,"device":true,"nmea":true,"raw":1};\n'
-            self.socket.send(watch_command)
-            self.log(f"Sent WATCH command: {watch_command.decode()}")
-            time.sleep(0.5)
+            # Process initial responses
+            initial_data = self.process_initial_responses()
             
-            data = self.socket.recv(4096).decode('utf-8').strip()
-            self.log(f"WATCH response: {data}")
-            
+            # Print diagnostics about detected devices
+            if self.devices:
+                print(f"✓ Detected {len(self.devices)} GPS device(s):")
+                for path in self.devices:
+                    print(f"  - {path}")
+            else:
+                print("⚠ No GPS devices detected initially")
+                print("Sending additional polls to discover devices...")
+                
+                # Try multiple polls to wake up devices
+                for i in range(5):
+                    self.send_poll()
+                    self.process_reports(timeout=1.0)
+                    time.sleep(0.5)
+                    
+                    # Check if devices were found
+                    if self.devices:
+                        print(f"✓ Found {len(self.devices)} GPS device(s) after additional polls!")
+                        for path in self.devices:
+                            print(f"  - {path}")
+                        break
+                        
             return True
         except Exception as e:
             print(f"Error connecting to GPSD: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+
+    def process_initial_responses(self):
+        """Process initial responses with a longer timeout"""
+        try:
+            self.socket.settimeout(2.0)  # Longer timeout for initial data
+            data = self.socket.recv(8192).decode('utf-8').strip()
+            self.log(f"Initial response: {data[:100]}...")
             
-    def process_reports(self, timeout=1.0):
-        """Process incoming GPSD reports"""
+            # Process JSON responses
+            parts = data.split(';')
+            
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+                    
+                try:
+                    report = json.loads(part)
+                    
+                    # Process devices report
+                    if report.get('class') == 'DEVICES':
+                        devices = report.get('devices', [])
+                        self.log(f"Found {len(devices)} devices in DEVICES report")
+                        
+                        for device in devices:
+                            path = device.get('path')
+                            if path:
+                                if path not in self.devices:
+                                    self.devices[path] = {}
+                                self.devices[path].update({
+                                    'driver': device.get('driver'),
+                                    'activated': device.get('activated', ''),
+                                    'last_update': datetime.now(),
+                                    'native': device.get('native', 0) == 1
+                                })
+                                self.log(f"Added device: {path}")
+                    
+                except json.JSONDecodeError as e:
+                    self.log(f"JSON error in initial response: {e}")
+            
+            # Reset to non-blocking timeout for normal operation
+            self.socket.settimeout(0.1)
+            return data
+            
+        except socket.timeout:
+            self.log("Timeout waiting for initial response")
+            self.socket.settimeout(0.1)  # Reset timeout
+            return None
+        except Exception as e:
+            self.log(f"Error processing initial response: {e}")
+            self.socket.settimeout(0.1)  # Reset timeout
+            return None
+
+    def process_reports(self, timeout=0.1):
+        """Process incoming GPSD reports with improved JSON parsing"""
         if not self.socket:
             return None
             
         try:
-            # Use a shorter timeout to process data chunks more efficiently
+            # Use a short timeout to avoid blocking
             self.socket.settimeout(timeout)
-            data = self.socket.recv(8192).decode('utf-8').strip()
             
-            if not data:
+            try:
+                # Receive data
+                data = self.socket.recv(4096).decode('utf-8', errors='replace')
+                if not data:
+                    return None
+            except socket.timeout:
+                # No data available
                 return None
                 
-            self.log(f"Received data length: {len(data)} bytes")
+            self.log(f"Received {len(data)} bytes of data")
             
-            # Process each line as a separate JSON object
+            # Add to the buffer for handling partial JSON
+            self.buffer += data
+            
+            # Process complete JSON objects
             reports = []
-            for line in data.split('\n'):
-                if not line.strip():
-                    continue
+            
+            while True:
+                # Find start of a JSON object
+                start_idx = self.buffer.find('{')
+                if start_idx == -1:
+                    self.buffer = ""  # No JSON start found
+                    break
+                    
+                # Find the end of the JSON object by matching braces
+                end_idx = -1
+                depth = 0
+                
+                for i in range(start_idx, len(self.buffer)):
+                    if self.buffer[i] == '{':
+                        depth += 1
+                    elif self.buffer[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end_idx = i
+                            break
+                            
+                if end_idx == -1:
+                    # No complete JSON object found
+                    break
+                    
+                # Extract complete JSON object
+                json_str = self.buffer[start_idx:end_idx + 1]
+                
+                # Find where to continue parsing
+                semicolon_idx = self.buffer.find(';', end_idx)
+                if (semicolon_idx != -1):
+                    self.buffer = self.buffer[semicolon_idx+1:]
+                else:
+                    self.buffer = self.buffer[end_idx+1:]
+                    
+                # Parse the JSON
                 try:
-                    report = json.loads(line)
+                    report = json.loads(json_str)
                     reports.append(report)
                     
-                    # Track devices based on their path
-                    if report.get('class') == 'TPV' and 'device' in report:
+                    # Process the report based on class
+                    if report.get('class') == 'VERSION':
+                        self.log(f"GPSD version: {report.get('release', 'unknown')}")
+                        
+                    elif report.get('class') == 'DEVICES':
+                        devices = report.get('devices', [])
+                        self.log(f"Found {len(devices)} devices")
+                        
+                        # Update devices dictionary
+                        for device in devices:
+                            path = device.get('path')
+                            if path:
+                                if path not in self.devices:
+                                    self.devices[path] = {}
+                                
+                                # Extract model from subtype1 if available
+                                model = "unknown"
+                                subtype1 = device.get('subtype1', '')
+                                if subtype1 and "MOD=" in subtype1:
+                                    import re
+                                    model_match = re.search(r'MOD=([^,]+)', subtype1)
+                                    if model_match:
+                                        model = model_match.group(1)
+                                
+                                # Update device info
+                                self.devices[path].update({
+                                    'driver': device.get('driver'),
+                                    'activated': device.get('activated', ''),
+                                    'subtype': device.get('subtype', ''),
+                                    'subtype1': subtype1,
+                                    'model': model,
+                                    'last_update': datetime.now(),
+                                    'native': device.get('native', 0) == 1
+                                })
+                                self.log(f"Updated device: {path} ({model})")
+                    
+                    elif report.get('class') == 'TPV' and 'device' in report:
                         device_path = report.get('device')
                         
-                        # Get basic position and fix information
-                        status = report.get('status', 0)
-                        mode = report.get('mode', 0)
+                        # Initialize device entry if needed
+                        if device_path not in self.devices:
+                            self.devices[device_path] = {}
                         
-                        # Determine the complete fix mode
+                        # Get fix mode and status
+                        mode = report.get('mode', 0)
+                        status = report.get('status', 0)
                         fix_mode = self.determine_fix_mode(report, mode, status)
                         
-                        # Store device info
-                        self.devices[device_path] = {
+                        # Update device info with position data
+                        self.devices[device_path].update({
                             'last_update': datetime.now(),
-                            'lat': report.get('lat', 0.0),
-                            'lon': report.get('lon', 0.0),
-                            'alt': report.get('alt', 0.0),
-                            'track': report.get('track', 0.0),
-                            'speed': report.get('speed', 0.0),
+                            'lat': report.get('lat'),
+                            'lon': report.get('lon'),
+                            'alt': report.get('alt'),
+                            'track': report.get('track'),
+                            'speed': report.get('speed'),
                             'mode': mode,
                             'status': status,
                             'fix_mode': fix_mode,
-                            'eph': report.get('eph', 0.0),  # Horizontal position error
-                            'epv': report.get('epv', 0.0),  # Vertical position error
-                            'sep': report.get('sep', 0.0),  # Estimated position error
-                            'raw_data': report.get('raw', ''),  # Store raw NMEA
-                            'time': report.get('time', '')  # GPS time
-                        }
+                            'eph': report.get('eph', 0.0),
+                            'epv': report.get('epv', 0.0),
+                            'has_fix': mode >= 2
+                        })
+                        
+                        # Log position data
+                        if 'lat' in report and 'lon' in report:
+                            self.log(f"Position: {report['lat']:.7f}, {report['lon']:.7f} for {device_path}")
                     
-                    # Process SKY reports for satellite info
                     elif report.get('class') == 'SKY' and 'device' in report:
                         device_path = report.get('device')
                         
-                        # Update satellite info if device exists
-                        if device_path in self.devices:
-                            self.devices[device_path].update({
-                                'satellites_used': len([s for s in report.get('satellites', []) if s.get('used', False)]),
-                                'satellites_visible': len(report.get('satellites', [])),
-                                'hdop': report.get('hdop', 0.0),
-                                'vdop': report.get('vdop', 0.0),
-                                'pdop': report.get('pdop', 0.0)
-                            })
-                        else:
-                            # Create new device entry if it doesn't exist
-                            self.devices[device_path] = {
-                                'last_update': datetime.now(),
-                                'satellites_used': len([s for s in report.get('satellites', []) if s.get('used', False)]),
-                                'satellites_visible': len(report.get('satellites', [])),
-                                'hdop': report.get('hdop', 0.0),
-                                'vdop': report.get('vdop', 0.0),
-                                'pdop': report.get('pdop', 0.0)
-                            }
-                    
-                    # Check NMEA sentences for RTK info
-                    elif report.get('class') == 'NMEA' and 'device' in report:
-                        device_path = report.get('device')
-                        sentence = report.get('string', '')
+                        # Initialize device entry if needed
+                        if device_path not in self.devices:
+                            self.devices[device_path] = {}
                         
-                        # Look for GGA sentence which contains RTK info
-                        if sentence.startswith('$GNGGA') or sentence.startswith('$GPGGA'):
-                            parts = sentence.split(',')
-                            if len(parts) >= 7:
-                                quality = parts[6]
-                                if quality in ['4', '5']:  # RTK fix or float
-                                    if device_path in self.devices:
-                                        fix_mode = "RTK_FIX" if quality == '4' else "RTK_FLOAT"
-                                        self.devices[device_path]['fix_mode'] = fix_mode
-                                        self.devices[device_path]['rtk_capable'] = True
-                                        self.log(f"RTK mode from NMEA for {device_path}: {quality} → {fix_mode}")
+                        # Process satellite data
+                        satellites = report.get('satellites', [])
+                        satellites_used = sum(1 for s in satellites if s.get('used'))
+                        
+                        # Update device info with satellite data
+                        self.devices[device_path].update({
+                            'last_update': datetime.now(),
+                            'satellites_used': satellites_used,
+                            'satellites_visible': len(satellites),
+                            'hdop': report.get('hdop', 0.0),
+                            'vdop': report.get('vdop', 0.0),
+                            'pdop': report.get('pdop', 0.0)
+                        })
+                        
+                        self.log(f"Satellites: {satellites_used}/{len(satellites)} for {device_path}")
                         
                 except json.JSONDecodeError as e:
-                    self.log(f"JSON error: {e} for line: {line[:50]}...")
+                    self.log(f"JSON error: {e} for: {json_str[:50]}...")
+                except Exception as e:
+                    self.log(f"Error processing report: {e}")
                     
             return reports
-        except socket.timeout:
-            # This is normal, just means no new data in the timeout period
-            return None
         except Exception as e:
-            print(f"Error receiving data: {e}")
+            self.log(f"Error in process_reports: {e}")
             import traceback
             traceback.print_exc()
             return None
-            
-    def determine_fix_mode(self, report, mode, status):
+    
+    def determine_fix_mode(self, report, mode, status=0):
         """Determine the detailed fix mode from various indicators"""
         
         # Start with basic mode mapping
@@ -287,50 +436,200 @@ class GpsdClient:
         
         return fix_mode
     
-    def get_device_status(self):
-        """Return status of all devices"""
-        return self.devices
+    def send_poll(self):
+        """Send enhanced poll command to gpsd"""
+        if not self.socket:
+            return False
+            
+        try:
+            # Send POLL command
+            self.socket.send(b'?POLL;\n')
+            
+            # Also periodically request device list
+            self.socket.send(b'?DEVICES;\n')
+            
+            return True
+        except Exception as e:
+            self.log(f"Error sending poll: {e}")
+            return False
+
+    def diagnose_connection(self):
+        """Run diagnostic tests on the GPSD connection"""
+        print("\n=== GPSD CONNECTION DIAGNOSTICS ===")
         
+        try:
+            if not self.socket:
+                print("⚠ No socket connection to GPSD")
+                return False
+                
+            # Test socket connection
+            try:
+                self.socket.settimeout(1.0)
+                self.socket.send(b'?VERSION;\n')
+                data = self.socket.recv(1024).decode('utf-8')
+                print(f"✓ Socket is responsive: {data[:50]}...")
+            except Exception as e:
+                print(f"✗ Socket test failed: {e}")
+                
+            # Check GPSD service status
+            try:
+                import subprocess
+                status = subprocess.run(['systemctl', 'status', 'gpsd'], 
+                                        capture_output=True, text=True)
+                print(f"\nGPSD service status:")
+                for line in status.stdout.split('\n')[:10]:
+                    print(f"  {line}")
+            except:
+                print("Could not check GPSD service status")
+                
+            # Check connected USB devices
+            try:
+                lsusb = subprocess.run(['lsusb'], capture_output=True, text=True)
+                print(f"\nConnected USB devices:")
+                for line in lsusb.stdout.split('\n'):
+                    if any(id in line.lower() for id in ['gps', 'u-blox', '1546']):
+                        print(f"  🛰️ {line} (GPS device)")
+                    else:
+                        print(f"  {line}")
+            except:
+                print("Could not list USB devices")
+                
+            # Check serial ports
+            try:
+                ls = subprocess.run(['ls', '-l', '/dev/ttyACM*', '/dev/ttyUSB*'], 
+                                   capture_output=True, text=True)
+                print(f"\nSerial ports:")
+                for line in ls.stdout.split('\n'):
+                    print(f"  {line}")
+            except:
+                print("Could not list serial ports")
+                
+            # Check GPSD devices
+            try:
+                gpsd_devices = subprocess.run(['gpspipe', '-w', '-n', '5'], 
+                                            capture_output=True, text=True, timeout=2)
+                print(f"\nGPSD raw output:")
+                for line in gpsd_devices.stdout.split('\n')[:5]:
+                    print(f"  {line}")
+            except:
+                print("Could not get GPSD raw output")
+                
+            # Reset socket timeout
+            self.socket.settimeout(0.1)
+            print("\nDiagnostics complete\n")
+            
+            return True
+        except Exception as e:
+            print(f"Error during diagnostics: {e}")
+            return False
+
     def determine_device_roles(self):
         """Identify which device is rover and which is base"""
+        global persistent_device_roles
         rover = None
         base = None
-        unknown_devices = []
         
-        for device_path, data in self.devices.items():
-            # A device is likely a rover if it:
-            # 1. Shows RTK_FIX or RTK_FLOAT mode
-            # 2. Has RTCM data
-            # 3. Has much higher precision (lower eph)
-            if (data.get('fix_mode') in ['RTK_FIX', 'RTK_FLOAT'] or 
-                data.get('rtk_capable', False) or
-                (data.get('eph', 99) < 0.5 and data.get('mode') == 3)):
-                
+        self.log(f"Determining device roles from {len(self.devices)} devices")
+        
+        # First check for previously assigned devices
+        if persistent_device_roles["rover"] in self.devices:
+            rover = persistent_device_roles["rover"]
+            self.log(f"Using previous rover: {rover}")
+        
+        if persistent_device_roles["base"] in self.devices:
+            base = persistent_device_roles["base"]
+            self.log(f"Using previous base: {base}")
+            
+        # If both roles are filled with different devices, we're done
+        if rover and base and rover != base:
+            return {'rover': rover, 'base': base}
+        
+        # Check devices that already have a role in gps_data
+        for device_path in self.devices:
+            if not rover and device_path == gps_data["rover"]["device_path"]:
                 rover = device_path
-                self.log(f"Identified rover: {device_path}")
-                
-            # Other devices with 3D fix are likely base stations
-            elif data.get('mode') == 3:
+                self.log(f"Re-using rover from gps_data: {rover}")
+            elif not base and device_path == gps_data["base"]["device_path"]:
                 base = device_path
-                self.log(f"Identified base: {device_path}")
-            else:
-                unknown_devices.append(device_path)
+                self.log(f"Re-using base from gps_data: {base}")
         
-        return {
-            'rover': rover,
-            'base': base,
-            'unknown': unknown_devices
-        }
-
-    def send_poll(self):
-        """Send poll command to gpsd"""
-        if self.socket:
-            try:
-                self.socket.send(b'?POLL;\n')
-                return True
-            except:
-                return False
-        return False
+        # If both roles are filled, we're done
+        if rover and base:
+            persistent_device_roles["rover"] = rover
+            persistent_device_roles["base"] = base
+            return {'rover': rover, 'base': base}
+        
+        # Try to identify devices by model/capabilities
+        for device_path, info in self.devices.items():
+            # Skip devices already assigned
+            if device_path == rover or device_path == base:
+                continue
+                
+            model = info.get('model', '').lower()
+            subtype = info.get('subtype', '').lower()
+            subtype1 = info.get('subtype1', '').lower()
+            satellites = info.get('satellites_used', 0)
+            
+            # If we see an explicit model, use it for identification
+            is_rover_candidate = False
+            is_base_candidate = False
+            
+            # Look for indicators in model or subtype
+            if any(x in model for x in ['f9r', 'zed-f9r']) or any(x in subtype1 for x in ['f9r', 'zed-f9r']):
+                # ZED-F9R is a rover with dead reckoning
+                is_rover_candidate = True
+                is_base_candidate = False
+            elif any(x in model for x in ['f9p', 'zed-f9p']) or any(x in subtype1 for x in ['f9p', 'zed-f9p']):
+                # ZED-F9P is a generic candidate (either rover or base)
+                is_rover_candidate = True
+                is_base_candidate = True
+                
+            # Check fix quality
+            fix_mode = info.get('fix_mode', 'UNKNOWN')
+            if fix_mode in ['RTK_FIX', 'RTK_FLOAT']:
+                # Devices with RTK fix are better rover candidates
+                is_rover_candidate = True
+            elif fix_mode in ['3D FIX', 'DGPS', 'WAAS', 'GPS']:
+                # Devices with decent fix can be either
+                is_base_candidate = True
+                
+            # Use satellite count as a quality indicator
+            has_good_satellites = satellites >= 8
+            
+            # Assign roles based on candidate status
+            if not rover and is_rover_candidate:
+                rover = device_path
+                self.log(f"Assigned rover based on capabilities: {device_path}")
+            elif not base and is_base_candidate:
+                base = device_path
+                self.log(f"Assigned base based on capabilities: {device_path}")
+        
+        # If we still have unassigned slots but have devices
+        if len(self.devices) > 0:
+            # Just get a list of devices
+            device_paths = list(self.devices.keys())
+            
+            # If no rover but we have devices, use first device
+            if not rover and len(device_paths) > 0:
+                rover = device_paths[0]
+                self.log(f"Defaulting to first device as rover: {rover}")
+                
+            # If no base but we have multiple devices, use second device
+            # Otherwise use the same device as the rover
+            if not base:
+                if len(device_paths) > 1 and device_paths[1] != rover:
+                    base = device_paths[1]
+                    self.log(f"Defaulting to second device as base: {base}")
+                else:
+                    base = rover
+                    self.log(f"Using same device for base as rover: {rover}")
+        
+        # Store the roles for next time
+        persistent_device_roles["rover"] = rover
+        persistent_device_roles["base"] = base
+        
+        # Always return something even if it's None
+        return {'rover': rover, 'base': base}
 
 # Initialize servo kit
 def init_motors():
@@ -413,6 +712,9 @@ def save_current_waypoint():
         # Add new waypoint
         waypoints_list.append(new_waypoint)
         
+        # Make sure the directory exists
+        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+        
         # Save to file
         with open(output_file, 'w') as f:
             json.dump(waypoints_list, f, indent=2)
@@ -428,6 +730,8 @@ def save_current_waypoint():
         
     except Exception as e:
         print(f"\nError saving waypoint: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def handle_keyboard(key):
@@ -737,19 +1041,56 @@ def print_gps_status(stdscr=None):
 
 def gpsd_reader_thread(gpsd_client):
     """Thread that reads from GPSD and updates the global data structure"""
-    global running, gps_data
+    global running, gps_data, persistent_device_roles
     
     poll_count = 0
+    last_devices_check = time.time()
+    last_sat_info_time = 0
     
     while running:
         try:
-            # Every 10 loops, send a POLL command
-            if poll_count % 10 == 0:
+            # Every 5 loops, send a POLL command
+            if poll_count % 5 == 0:
                 gpsd_client.send_poll()
+                
+                # Every 10 polls, do a deeper refresh by explicitly requesting DEVICES
+                if poll_count % 50 == 0:
+                    gpsd_client.socket.send(b'?DEVICES;\n')
+                    
             poll_count += 1
             
             # Process reports from GPSD
-            gpsd_client.process_reports()
+            reports = gpsd_client.process_reports()
+            
+            # Periodically check if we need to refresh satellite data
+            now = time.time()
+            if now - last_sat_info_time > 5:  # Every 5 seconds
+                # Set up a more watchful polling for satellite data
+                for device_path in gpsd_client.devices:
+                    # Check if we need satellite data for this device
+                    if (device_path == gps_data["rover"]["device_path"] and 
+                        gps_data["rover"]["satellites_visible"] == 0):
+                        gpsd_client.log(f"Requesting satellite data for {device_path}")
+                        watch_cmd = f'{{"class":"WATCH","enable":true,"json":true,"nmea":true,"device":"{device_path}"}}'
+                        gpsd_client.socket.send(f'?WATCH={watch_cmd};\n'.encode())
+                        time.sleep(0.2)
+                        gpsd_client.socket.send(b'?POLL;\n')
+                        
+                last_sat_info_time = now
+                                
+            # If we haven't seen devices in a while, try to rediscover
+            if (now - last_devices_check > 10) and not gpsd_client.devices:
+                print("No GPS devices found, attempting rediscovery...")
+                gpsd_client.socket.send(b'?DEVICES;\n')
+                time.sleep(1.0)
+                gpsd_client.process_reports(timeout=2.0)
+                last_devices_check = now
+                
+                if gpsd_client.devices:
+                    print(f"Rediscovered {len(gpsd_client.devices)} GPS devices:")
+                    for path, info in gpsd_client.devices.items():
+                        model = info.get('model', 'unknown')
+                        print(f"  - {path}: {model}")
             
             # Determine device roles (rover vs base)
             roles = gpsd_client.determine_device_roles()
@@ -757,57 +1098,95 @@ def gpsd_reader_thread(gpsd_client):
             # Update the global gps_data structure with device information
             if roles['rover'] and roles['rover'] in gpsd_client.devices:
                 device = gpsd_client.devices[roles['rover']]
+                
+                # Update device path
                 gps_data["rover"]["device_path"] = roles['rover']
-                gps_data["rover"]["lat"] = device.get('lat')
-                gps_data["rover"]["lon"] = device.get('lon')
+                
+                # Update position data if available
+                if 'lat' in device and 'lon' in device:
+                    gps_data["rover"]["lat"] = device.get('lat')
+                    gps_data["rover"]["lon"] = device.get('lon')
+                    
+                # Update other fields
+                gps_data["rover"]["fix_mode"] = device.get('fix_mode', 'UNKNOWN')
                 gps_data["rover"]["heading"] = device.get('track')
                 gps_data["rover"]["speed"] = device.get('speed')
-                gps_data["rover"]["fix_mode"] = device.get('fix_mode', 'UNKNOWN')
-                gps_data["rover"]["last_update"] = time.time()
-                gps_data["rover"]["satellites_used"] = device.get('satellites_used', 0)
-                gps_data["rover"]["satellites_visible"] = device.get('satellites_visible', 0)
-                gps_data["rover"]["precision"]["h"] = device.get('eph', 0.0)
-                gps_data["rover"]["precision"]["v"] = device.get('epv', 0.0)
-                gps_data["rover"]["pdop"] = device.get('pdop', 0.0)
-                gps_data["rover"]["hdop"] = device.get('hdop', 0.0)
-                gps_data["rover"]["vdop"] = device.get('vdop', 0.0)
                 
+                # IMPORTANT FIX: Only update satellite counts if we get actual values
+                if device.get('satellites_used', 0) > 0:
+                    gps_data["rover"]["satellites_used"] = device.get('satellites_used', 0)
+                    gps_data["rover"]["satellites_visible"] = device.get('satellites_visible', 0)
+                
+                # IMPORTANT FIX: Only update HDOP/precision if we get actual values
+                if device.get('hdop', 0.0) > 0.0:
+                    gps_data["rover"]["hdop"] = device.get('hdop', 0.0)
+                
+                # Update precision values only if they exist
+                if device.get('eph', 0.0) > 0.0:
+                    gps_data["rover"]["precision"]["h"] = device.get('eph', 0.0)
+                if device.get('epv', 0.0) > 0.0:
+                    gps_data["rover"]["precision"]["v"] = device.get('epv', 0.0)
+                if device.get('pdop', 0.0) > 0.0:
+                    gps_data["rover"]["pdop"] = device.get('pdop', 0.0)
+                
+                # Update timestamp
+                gps_data["rover"]["last_update"] = time.time()
+            
             if roles['base'] and roles['base'] in gpsd_client.devices:
                 device = gpsd_client.devices[roles['base']]
+                
+                # Update device path
                 gps_data["base"]["device_path"] = roles['base']
-                gps_data["base"]["lat"] = device.get('lat')
-                gps_data["base"]["lon"] = device.get('lon')
+                
+                # Update position data if available
+                if 'lat' in device and 'lon' in device:
+                    gps_data["base"]["lat"] = device.get('lat')
+                    gps_data["base"]["lon"] = device.get('lon')
+                    
+                # Update other fields
+                gps_data["base"]["fix_mode"] = device.get('fix_mode', 'UNKNOWN')
                 gps_data["base"]["heading"] = device.get('track')
                 gps_data["base"]["speed"] = device.get('speed')
-                gps_data["base"]["fix_mode"] = device.get('fix_mode', 'UNKNOWN')
+                
+                # IMPORTANT FIX: Only update satellite counts if we get actual values
+                if device.get('satellites_used', 0) > 0:
+                    gps_data["base"]["satellites_used"] = device.get('satellites_used', 0)
+                    gps_data["base"]["satellites_visible"] = device.get('satellites_visible', 0)
+                
+                # IMPORTANT FIX: Only update HDOP if we get actual values
+                if device.get('hdop', 0.0) > 0.0:
+                    gps_data["base"]["hdop"] = device.get('hdop', 0.0)
+                
+                # Update precision values only if they exist
+                if device.get('eph', 0.0) > 0.0:
+                    gps_data["base"]["precision"]["h"] = device.get('eph', 0.0)
+                if device.get('epv', 0.0) > 0.0:
+                    gps_data["base"]["precision"]["v"] = device.get('epv', 0.0)
+                if device.get('pdop', 0.0) > 0.0:
+                    gps_data["base"]["pdop"] = device.get('pdop', 0.0)
+                
+                # Update timestamp
                 gps_data["base"]["last_update"] = time.time()
-                gps_data["base"]["satellites_used"] = device.get('satellites_used', 0)
-                gps_data["base"]["satellites_visible"] = device.get('satellites_visible', 0)
-                gps_data["base"]["precision"]["h"] = device.get('eph', 0.0)
-                gps_data["base"]["precision"]["v"] = device.get('epv', 0.0)
-                gps_data["base"]["pdop"] = device.get('pdop', 0.0)
-                gps_data["base"]["hdop"] = device.get('hdop', 0.0)
-                gps_data["base"]["vdop"] = device.get('vdop', 0.0)
-                
-            # If no clear rover/base identification, use the first available device
-            if not roles['rover'] and not roles['base'] and gpsd_client.devices:
-                device_path = list(gpsd_client.devices.keys())[0]
-                device = gpsd_client.devices[device_path]
-                
-                # Assign to rover
-                gps_data["rover"]["device_path"] = device_path
-                gps_data["rover"]["lat"] = device.get('lat')
-                gps_data["rover"]["lon"] = device.get('lon')
-                gps_data["rover"]["heading"] = device.get('track')
-                gps_data["rover"]["speed"] = device.get('speed')
-                gps_data["rover"]["fix_mode"] = device.get('fix_mode', 'UNKNOWN')
-                gps_data["rover"]["last_update"] = time.time()
-                
+            
             # Small sleep to avoid excessive CPU usage
             time.sleep(CONFIG["update_interval"])
                 
         except Exception as e:
             print(f"Error in GPSD reader thread: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Try to reconnect if socket issue
+            if "socket" in str(e).lower() or "connection" in str(e).lower():
+                print("Attempting to reconnect to GPSD...")
+                try:
+                    gpsd_client.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    gpsd_client.socket.connect((gpsd_client.host, gpsd_client.port))
+                    gpsd_client.socket.send(b'?WATCH={"enable":true,"json":true,"nmea":true,"raw":1,"scaled":true,"device":true};\n')
+                    print("Reconnected to GPSD")
+                except Exception as reconnect_error:
+                    print(f"Failed to reconnect: {reconnect_error}")
+            
             time.sleep(1)  # Sleep longer on error
 
 def console_ui_thread():
@@ -969,9 +1348,55 @@ def main():
     
     # Initialize GPSD client
     gpsd_client = GpsdClient(host=CONFIG["gpsd_host"], port=CONFIG["gpsd_port"], debug=CONFIG["debug"])
-    if not gpsd_client.connect():
-        print("Failed to connect to GPSD. Is the service running?")
-        return 1
+    
+    # After connecting to GPSD
+    if gpsd_client.connect():
+        print("Connected to GPSD, discovering devices...")
+        
+        # More aggressive device discovery
+        discovery_attempts = 8  # Try multiple times
+        for i in range(discovery_attempts):
+            print(f"Device discovery attempt {i+1}/{discovery_attempts}...")
+            
+            # Send both DEVICES and POLL commands
+            gpsd_client.socket.send(b'?DEVICES;\n')
+            time.sleep(0.2)
+            gpsd_client.socket.send(b'?POLL;\n')
+            time.sleep(0.8)  # Wait longer between attempts
+            
+            # Process with longer timeout on later attempts
+            timeout = 1.0 if i < 3 else 3.0
+            gpsd_client.process_reports(timeout=timeout)
+            
+            # Check if we have devices
+            if gpsd_client.devices:
+                print(f"✓ Found {len(gpsd_client.devices)} GPS devices:")
+                for path, info in gpsd_client.devices.items():
+                    model = info.get('model', 'unknown')
+                    print(f"  - {path}: {model}")
+                
+                # If we found enough devices, we can stop early
+                if len(gpsd_client.devices) >= 2:
+                    print("Found multiple GPS devices, continuing...")
+                    break
+    
+    if gpsd_client.devices:
+        print(f"Found {len(gpsd_client.devices)} GPS devices:")
+        for path, info in gpsd_client.devices.items():
+            model = info.get('model', 'unknown')
+            print(f"  - {path}: {model}")
+        
+        # Request SKY reports explicitly for satellite data
+        print("Requesting satellite data...")
+        for i in range(3):
+            gpsd_client.send_poll()
+            time.sleep(0.5)
+            gpsd_client.process_reports(timeout=1.0)
+        
+        # Check for satellite data
+        for path, info in gpsd_client.devices.items():
+            if 'satellites_used' in info:
+                print(f"  {path}: {info['satellites_used']}/{info.get('satellites_visible', 0)} satellites")
     
     # Initialize motors if not disabled
     if not args.no_motors:
