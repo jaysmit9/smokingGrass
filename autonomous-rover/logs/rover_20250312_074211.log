@@ -1,0 +1,15 @@
+2025-03-12 07:42:11,117,INFO,Starting in SIMULATION mode
+2025-03-12 07:42:11,118,INFO,Loading waypoints from: polygon_data.json
+2025-03-12 07:42:11,119,ERROR,Error loading waypoints: [Errno 2] No such file or directory: 'polygon_data.json'
+2025-03-12 07:42:11,119,INFO,Initializing GPS Monitor (simulation=False)
+2025-03-12 07:42:11,124,INFO,Connected to front GPS on /dev/ttyACM0
+2025-03-12 07:42:11,125,INFO,Connected to rear GPS on /dev/ttyACM1
+2025-03-12 07:42:11,145,INFO,Motor controller initialized successfully
+2025-03-12 07:42:11,145,INFO,Stanley Controller initialized with 2 waypoints
+2025-03-12 07:42:11,146,INFO,Steering sensitivity: 5.0° (tanh denominator)
+2025-03-12 07:42:11,146,INFO,Max steering angle: 90.0°
+2025-03-12 07:42:11,147,INFO,Waypoint reach threshold: 1.0 meters
+2025-03-12 07:42:11,148,INFO,Added extension waypoint at (0.000100, 0.000100)
+2025-03-12 07:42:11,149,INFO,Starting simulation...
+2025-03-12 07:42:11,153,INFO,Reached final waypoint
+2025-03-12 07:42:12,751,INFO,Simulation completed

@@ -1,0 +1,4 @@
+2025-03-12 10:20:36,591,lat,lon,heading,speed,target_idx,total_waypoints,distance,cte,steering_deg,yaw_error_deg,left_speed,right_speed,servo_angle
+2025-03-12 10:20:36,592,error,must be real number; not NoneType
+2025-03-12 10:20:37,614,error,'steering_angle'
+2025-03-12 10:20:38,643,error,'steering_angle'

@@ -1,0 +1,91 @@
+2025-03-12 15:29:31,075,INFO,Starting in REAL HARDWARE mode
+2025-03-12 15:29:31,077,CRITICAL,Using waypoints file: /home/jay/projects/grassSmoking/autonomous-rover/data/polygon_data.json
+2025-03-12 15:29:31,078,CRITICAL,Successfully opened waypoints file
+2025-03-12 15:29:31,079,CRITICAL,Raw file content (first 100 chars): [
+  {
+    "lat": 34.15195716,
+    "lon": -77.86700018666667
+  },
+  {
+    "lat": 34.152101085,
+    "l...
+2025-03-12 15:29:31,081,CRITICAL,==== LOADED WAYPOINTS ====
+2025-03-12 15:29:31,082,CRITICAL,WP 0: (34.1519572, -77.8670002)
+2025-03-12 15:29:31,083,CRITICAL,WP 1: (34.1521011, -77.8669438)
+2025-03-12 15:29:31,084,CRITICAL,WP 2: (34.1520569, -77.8668358)
+2025-03-12 15:29:31,086,CRITICAL,WP 3: (34.1519539, -77.8668528)
+2025-03-12 15:29:31,086,CRITICAL,========================
+2025-03-12 15:29:31,088,INFO,Initializing GPS Monitor (simulation=False)
+2025-03-12 15:29:31,096,INFO,Connected to front GPS on /dev/ttyACM0
+2025-03-12 15:29:31,096,INFO,Connected to rear GPS on /dev/ttyACM1
+2025-03-12 15:29:31,157,INFO,Motor controller initialized successfully
+2025-03-12 15:29:31,158,INFO,Stanley Controller initialized with 4 waypoints
+2025-03-12 15:29:31,159,INFO,Steering sensitivity: 60.0° (tanh denominator)
+2025-03-12 15:29:31,160,INFO,Max steering angle: 90.0°
+2025-03-12 15:29:31,161,INFO,Waypoint reach threshold: 1.0 meters
+2025-03-12 15:29:31,161,CRITICAL,==== CONTROLLER WAYPOINTS ====
+2025-03-12 15:29:31,162,CRITICAL,WP 0: (34.1519572, -77.8670002)
+2025-03-12 15:29:31,163,CRITICAL,WP 1: (34.1521011, -77.8669438)
+2025-03-12 15:29:31,163,CRITICAL,WP 2: (34.1520569, -77.8668358)
+2025-03-12 15:29:31,164,CRITICAL,WP 3: (34.1519539, -77.8668528)
+2025-03-12 15:29:31,166,CRITICAL,========================
+2025-03-12 15:29:31,167,INFO,Initializing GPS Monitor (simulation=False)
+2025-03-12 15:29:31,174,INFO,Connected to front GPS on /dev/ttyACM0
+2025-03-12 15:29:31,178,INFO,Connected to rear GPS on /dev/ttyACM1
+2025-03-12 15:29:31,203,INFO,Motor controller initialized successfully
+2025-03-12 15:29:31,205,CRITICAL,MOTOR CONTROLLER MAX SPEED: 0.3
+2025-03-12 15:29:31,209,INFO,Starting hardware control loop. Press Ctrl+C to stop.
+2025-03-12 15:29:31,210,INFO,Performing GPS preflight check...
+2025-03-12 15:29:31,212,WARNING,No heading available (missing GPS data)
+2025-03-12 15:29:31,213,WARNING,Waiting for valid GPS data... (lat=None, lon=None, heading=None)
+2025-03-12 15:29:32,094,ERROR,Error in rear GPS reader: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+2025-03-12 15:29:32,215,INFO,GPS preflight check passed! Position: (34.1519217, -77.8668757), Heading: 323.4°
+2025-03-12 15:29:32,218,INFO,DEBUG - TARGET WP: 0 [12.1m] | GPS Heading: 323.4°, Bearing to target: 289.0°, Needed turn: -34.4° LEFT
+2025-03-12 15:29:32,221,WARNING,=== COORDINATE DEBUG ===
+2025-03-12 15:29:32,222,WARNING,Current position: (34.1519217, -77.8668757), Heading: 323.4°
+2025-03-12 15:29:32,233,WARNING,Target waypoint 0: (34.1519572, -77.8670002)
+2025-03-12 15:29:32,240,WARNING,DIRECT BEARING CALCULATION: 289.0°
+2025-03-12 15:29:32,243,WARNING,CONTROLLER BEARING CALCULATION: 289.0°
+2025-03-12 15:29:32,245,WARNING,WITH SWAPPED TARGET COORDS: 165.7°
+2025-03-12 15:29:32,246,WARNING,WITH SWAPPED CURRENT COORDS: 256.4°
+2025-03-12 15:29:32,248,WARNING,=== END DEBUG ===
+2025-03-12 15:29:32,250,INFO,Reached waypoint 0. New target: waypoint 1
+2025-03-12 15:29:32,252,WARNING,MOTOR DEBUG - Raw steering command: -46.6°
+2025-03-12 15:29:32,253,ERROR,Error in front GPS reader: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+2025-03-12 15:29:32,254,INFO,LEFT TURN: 46.6°
+2025-03-12 15:29:32,257,WARNING,MOTOR DEBUG - LEFT turn factors: L=0.482, R=1.000
+2025-03-12 15:29:32,261,WARNING,MOTOR DEBUG - Speed=0.15, Factors: L=0.48, R=1.00
+2025-03-12 15:29:32,262,WARNING,MOTOR DEBUG - Final speeds: L=0.07, R=0.15
+2025-03-12 15:29:32,264,INFO,Applying to motors - Left: 0.07, Right: 0.15
+2025-03-12 15:29:32,271,INFO,
+2025-03-12 15:29:32,272,INFO,DISTANCE TO TARGET: 20.86m [--------------------]
+2025-03-12 15:29:32,278,INFO,WAYPOINT: 1/3
+2025-03-12 15:29:32,280,INFO,
+2025-03-12 15:29:32,284,ERROR,Error in control loop: 'steering_angle'
+2025-03-12 15:29:32,290,INFO,Motors stopped
+2025-03-12 15:29:33,303,INFO,DEBUG - TARGET WP: 1 [20.9m] | GPS Heading: 323.4°, Bearing to target: 342.6°, Needed turn: 19.2° RIGHT
+2025-03-12 15:29:33,304,WARNING,=== COORDINATE DEBUG ===
+2025-03-12 15:29:33,307,WARNING,Current position: (34.1519217, -77.8668757), Heading: 323.4°
+2025-03-12 15:29:33,309,WARNING,Target waypoint 1: (34.1521011, -77.8669438)
+2025-03-12 15:29:33,311,WARNING,DIRECT BEARING CALCULATION: 342.6°
+2025-03-12 15:29:33,314,WARNING,CONTROLLER BEARING CALCULATION: 342.6°
+2025-03-12 15:29:33,316,WARNING,WITH SWAPPED TARGET COORDS: 165.7°
+2025-03-12 15:29:33,318,WARNING,WITH SWAPPED CURRENT COORDS: 256.4°
+2025-03-12 15:29:33,321,WARNING,=== END DEBUG ===
+2025-03-12 15:29:33,335,INFO,Reached waypoint 1. New target: waypoint 2
+2025-03-12 15:29:33,337,WARNING,MOTOR DEBUG - Raw steering command: 27.8°
+2025-03-12 15:29:33,339,INFO,RIGHT TURN: 27.8°
+2025-03-12 15:29:33,341,WARNING,MOTOR DEBUG - RIGHT turn factors: L=1.000, R=0.691
+2025-03-12 15:29:33,345,WARNING,MOTOR DEBUG - Speed=0.21, Factors: L=1.00, R=0.69
+2025-03-12 15:29:33,347,WARNING,MOTOR DEBUG - Final speeds: L=0.21, R=0.15
+2025-03-12 15:29:33,348,INFO,Applying to motors - Left: 0.21, Right: 0.15
+2025-03-12 15:29:33,358,INFO,
+2025-03-12 15:29:33,360,INFO,DISTANCE TO TARGET: 15.43m [#####---------------]
+2025-03-12 15:29:33,369,INFO,WAYPOINT: 2/3
+2025-03-12 15:29:33,371,INFO,
+2025-03-12 15:29:33,373,ERROR,Error in control loop: 'steering_angle'
+2025-03-12 15:29:33,380,INFO,Motors stopped
+2025-03-12 15:29:33,444,ERROR,Error in front GPS reader: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
+2025-03-12 15:29:33,656,INFO,Manual stop requested
+2025-03-12 15:29:33,657,INFO,Stopping motors and cleaning up...
+2025-03-12 15:29:33,661,INFO,Motors stopped

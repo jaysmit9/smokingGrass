@@ -1,0 +1,4 @@
+2025-03-12 10:43:57,942,lat,lon,heading,speed,target_idx,total_waypoints,distance,cte,steering_deg,yaw_error_deg,left_speed,right_speed,servo_angle
+2025-03-12 10:43:58,953,error,'steering_angle'
+2025-03-12 10:43:59,974,error,'steering_angle'
+2025-03-12 10:44:00,998,error,name 'verify_parameter_ordering' is not defined

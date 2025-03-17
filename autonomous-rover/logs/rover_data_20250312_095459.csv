@@ -1,0 +1,5 @@
+2025-03-12 09:54:59,278,lat,lon,heading,speed,target_idx,total_waypoints,distance,cte,steering_deg,yaw_error_deg,left_speed,right_speed,servo_angle
+2025-03-12 09:54:59,279,error,must be real number; not NoneType
+2025-03-12 09:55:00,302,error,name 'verify_parameter_ordering' is not defined
+2025-03-12 09:55:01,322,error,'steering_angle'
+2025-03-12 09:55:02,347,error,'steering_angle'

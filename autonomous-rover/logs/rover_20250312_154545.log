@@ -1,0 +1,32 @@
+2025-03-12 15:45:45,490,INFO,Starting in REAL HARDWARE mode
+2025-03-12 15:45:45,491,CRITICAL,Using waypoints file: /home/jay/projects/grassSmoking/autonomous-rover/data/polygon_data.json
+2025-03-12 15:45:45,491,CRITICAL,Successfully opened waypoints file
+2025-03-12 15:45:45,492,CRITICAL,Raw file content (first 100 chars): [
+  {
+    "lat": 34.15195716,
+    "lon": -77.86700018666667
+  },
+  {
+    "lat": 34.152101085,
+    "l...
+2025-03-12 15:45:45,493,CRITICAL,==== LOADED WAYPOINTS ====
+2025-03-12 15:45:45,494,CRITICAL,WP 0: (34.1519572, -77.8670002)
+2025-03-12 15:45:45,494,CRITICAL,WP 1: (34.1521011, -77.8669438)
+2025-03-12 15:45:45,495,CRITICAL,WP 2: (34.1520569, -77.8668358)
+2025-03-12 15:45:45,495,CRITICAL,WP 3: (34.1519539, -77.8668528)
+2025-03-12 15:45:45,496,CRITICAL,========================
+2025-03-12 15:45:45,496,INFO,Initializing GPS Monitor (simulation=False)
+2025-03-12 15:45:45,501,INFO,Connected to front GPS on /dev/ttyACM0
+2025-03-12 15:45:45,502,INFO,Connected to rear GPS on /dev/ttyACM1
+2025-03-12 15:45:45,521,INFO,Motor controller initialized successfully
+2025-03-12 15:45:45,522,INFO,Stanley Controller initialized with 4 waypoints
+2025-03-12 15:45:45,523,INFO,Steering sensitivity: 60.0° (tanh denominator)
+2025-03-12 15:45:45,523,INFO,Max steering angle: 90.0°
+2025-03-12 15:45:45,524,INFO,Waypoint reach threshold: 1.0 meters
+2025-03-12 15:45:45,525,CRITICAL,==== CONTROLLER WAYPOINTS ====
+2025-03-12 15:45:45,525,CRITICAL,WP 0: (34.1519572, -77.8670002)
+2025-03-12 15:45:45,526,CRITICAL,WP 1: (34.1521011, -77.8669438)
+2025-03-12 15:45:45,527,CRITICAL,WP 2: (34.1520569, -77.8668358)
+2025-03-12 15:45:45,529,CRITICAL,WP 3: (34.1519539, -77.8668528)
+2025-03-12 15:45:45,530,CRITICAL,========================
+2025-03-12 15:45:45,530,ERROR,Error in run_hardware: name 'initialize_gps_with_retry' is not defined

@@ -1,0 +1,4 @@
+2025-03-12 15:07:18,795,lat,lon,heading,speed,target_idx,total_waypoints,distance,cte,steering_deg,yaw_error_deg,left_speed,right_speed,servo_angle
+2025-03-12 15:07:19,807,error,'steering_angle'
+2025-03-12 15:07:20,833,error,'steering_angle'
+2025-03-12 15:07:21,856,error,'steering_angle'
